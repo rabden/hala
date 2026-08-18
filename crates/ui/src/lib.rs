@@ -19,6 +19,7 @@ pub mod badges;
 pub mod changes;
 pub mod comments;
 pub mod composer;
+pub mod context_ring;
 pub mod edge_fade;
 pub mod frost;
 pub mod history;

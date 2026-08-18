@@ -57,8 +57,12 @@ elif has "$line" '"method":"session/new"'; then
   # Advertise config options: model (current differs from the tests' request,
   # forcing a set) and thought_level (current high). The model config option
   # feeds discovery first; the first-class `models` state (SessionModelState)
-  # is the legacy fallback — codex-acp enumerates model × effort there.
-  emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\",\"models\":{\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}],\"currentModelId\":\"grok-4.5\"},\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"grok-4-fast\",\"options\":[{\"value\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"value\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]},{\"id\":\"effort\",\"name\":\"Reasoning effort\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"high\",\"options\":[{\"value\":\"low\",\"name\":\"Low\"},{\"value\":\"medium\",\"name\":\"Medium\"},{\"value\":\"high\",\"name\":\"High\"}]}]}}"
+  # is the legacy fallback — codex-acp enumerates model × effort there. The
+  # models state's currentModelId deliberately matches the config option's
+  # currentValue: the ring's 200k window must come from the REQUESTED model
+  # (grok-4.5's _meta), not the boot-time current (grok-4-fast, which
+  # advertises none).
+  emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\",\"models\":{\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\",\"_meta\":{\"totalContextTokens\":200000}}],\"currentModelId\":\"grok-4-fast\"},\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"grok-4-fast\",\"options\":[{\"value\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"value\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]},{\"id\":\"effort\",\"name\":\"Reasoning effort\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"high\",\"options\":[{\"value\":\"low\",\"name\":\"Low\"},{\"value\":\"medium\",\"name\":\"Medium\"},{\"value\":\"high\",\"name\":\"High\"}]}]}}"
 else
   exit 1
 fi
@@ -86,6 +90,17 @@ case "$promptline" in
   else
     emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
   fi
+  ;;
+
+*scenario:grok-context*)
+  # Grok's context shape: chunks carry the live context total in
+  # `update._meta.totalTokens`; the settled prompt carries the same live
+  # total in `_meta.totalTokens` while `_meta.usage` is a per-turn BILLING
+  # ledger (several model calls summed — larger than the live total) that
+  # must never feed the ring.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"pong"},"_meta":{"totalTokens":5174,"chunkId":14}}'
+  update '{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"hmm"},"_meta":{"totalTokens":6000}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\",\"_meta\":{\"totalTokens\":13667,\"inputTokens\":13650,\"outputTokens\":17,\"usage\":{\"inputTokens\":40950,\"outputTokens\":51,\"totalTokens\":41001}}}}"
   ;;
 
 *scenario:many*)

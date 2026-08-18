@@ -180,6 +180,19 @@ pub enum SessionStatus {
     Errored,
 }
 
+/// Context window usage measurement for a chat session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsage {
+    pub used: u64,
+    pub size: u64,
+    /// True when `used` is a harness-side estimate (grok's chunk counter)
+    /// rather than an exact ACP `usage_update` measurement — rendered with
+    /// a `~` so estimates never present as exact.
+    #[serde(default)]
+    pub estimated: bool,
+}
+
 /// Live run status for a chat — drives the Working indicator and sidebar status dots.
 /// Staleness-checked client-side against `updated_at` so a crashed backend never shows
 /// an eternal "Working".
@@ -191,6 +204,8 @@ pub struct Session {
     pub status: SessionStatus,
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<ContextUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

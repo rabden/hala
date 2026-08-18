@@ -1382,6 +1382,88 @@ fn session_update_events(
     }
 }
 
+/// Grok's session responses carry the current model's context window at
+/// `models.availableModels[]._meta.totalContextTokens`, keyed by
+/// `models.currentModelId`.
+fn grok_context_window(session_response: &Value) -> Option<u64> {
+    let models = session_response.get("models")?;
+    let current = models.get("currentModelId").and_then(Value::as_str)?;
+    model_context_window(session_response, current)
+}
+
+/// The advertised context window of a SPECIFIC model id. Used when a model
+/// config-option set is queued: `currentModelId` still names the PREVIOUS
+/// model at `session/new` time, so the ring must be sized against the model
+/// the run asked for, not the one the session booted with.
+fn model_context_window(session_response: &Value, model_id: &str) -> Option<u64> {
+    session_response
+        .get("models")?
+        .get("availableModels")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("modelId").and_then(Value::as_str) == Some(model_id))
+        .and_then(|m| m.get("_meta"))
+        .and_then(|meta| meta.get("totalContextTokens"))
+        .and_then(Value::as_u64)
+        .filter(|size| *size > 0)
+}
+
+/// [`session_update_events`] plus grok's live context gauge: grok emits no
+/// `usage_update`; every streaming chunk carries the running context total
+/// in `update._meta.totalTokens` — the same counter grok's own `/context`
+/// bar uses (the last model-reported context length plus a bytes/4 estimate
+/// of results since), sized here against the session model's window.
+fn session_update_events_with_context(
+    method: &str,
+    params: &Value,
+    session_id: &str,
+    subagents: &mut SubagentTracker,
+    harness: HarnessId,
+    context_window: Option<u64>,
+) -> Vec<AgentEvent> {
+    let mut events = session_update_events(method, params, session_id, subagents);
+    if let (HarnessId::Grok, Some(size)) = (harness, context_window)
+        && method == "session/update"
+        && params.get("sessionId").and_then(Value::as_str) == Some(session_id)
+        // Zero totals are grok's cancelled / queue-removed mis-report (the
+        // settled-prompt path filters the same shape) — never a real 0%.
+        && let Some(used) = params
+            .get("update")
+            .and_then(|u| u.get("_meta"))
+            .and_then(|m| m.get("totalTokens"))
+            .and_then(Value::as_u64)
+            .filter(|used| *used > 0)
+    {
+        // Capped at the window: grok compacts before the context crosses it,
+        // so a larger value is a mis-report, not a real gauge.
+        events.push(AgentEvent::ContextUsage {
+            used: used.min(size),
+            size,
+            // The chunk counter is the model-reported length plus a bytes/4
+            // estimate of results since — an estimate, not a measurement.
+            estimated: true,
+        });
+    }
+    events
+}
+
+/// The live context total from a settled `session/prompt` response: grok
+/// reports it as `_meta.totalTokens` (the same counter the chunks carry) or,
+/// failing that, as the last model call's `_meta.inputTokens +
+/// _meta.outputTokens`. `_meta.usage.totalTokens` is deliberately NOT read:
+/// that object is a per-turn billing ledger summing every model call (each
+/// resends the whole context), which routinely exceeds the window on
+/// tool-using turns.
+fn response_total_tokens(res: &Result<Value, HarnessError>) -> Option<u64> {
+    let resp = res.as_ref().ok()?;
+    let meta = resp.get("_meta")?;
+    let field = |key: &str| meta.get(key).and_then(Value::as_u64);
+    field("totalTokens").or_else(|| {
+        let (input, output) = (field("inputTokens"), field("outputTokens"));
+        (input.is_some() || output.is_some()).then(|| input.unwrap_or(0) + output.unwrap_or(0))
+    })
+}
+
 /// Per-turn token usage from a settled `session/prompt` response, when the
 /// adapter attaches it (tolerant of both field spellings; absent → nothing).
 fn usage_from_response(res: &Result<Value, HarnessError>) -> Option<AgentEvent> {
@@ -1582,7 +1664,6 @@ fn handle_server_request_live(
     Vec::new()
 }
 
-
 /// Await a setup request while draining incoming messages, so a `session/load`
 /// whose replay outruns the incoming channel's capacity can't deadlock the
 /// reader. Replayed `session/update`s are dropped (the doc already holds the
@@ -1649,7 +1730,6 @@ fn track_turn_signals(
         _ => {}
     }
 }
-
 
 /// A mid-turn `_session/steering` call. `idleBehavior: promptRequired`
 /// covers the turn-ended race: the agent hands the text back instead of
@@ -1748,6 +1828,11 @@ async fn run_session(session: Session) {
                 "session/new returned no sessionId".into(),
             ));
         }
+        // Grok's model state rides the session response — the current
+        // model's context window sizes the ContextUsage ring events.
+        // Computed before the snapshot move below; a queued model set may
+        // override it with the REQUESTED model's window.
+        let current_window = grok_context_window(&session_response);
         // Apply the run's model + effort + model options through the
         // session's advertised config options (ACP has no per-prompt model
         // field). Best-effort: a rejected set is logged, never fatal — the
@@ -1755,12 +1840,22 @@ async fn run_session(session: Session) {
         let efforts = effort_values(request.reasoning, request.model.as_deref());
         let requested_model = request.model.as_deref();
         let mut options_snapshot = session_response;
-        for (config_id, payload) in config_option_sets(
+        let option_sets = config_option_sets(
             &options_snapshot,
             requested_model,
             &efforts,
             &request.model_options,
-        ) {
+        );
+        // A queued model set means the run will NOT run under
+        // `currentModelId` — size the ring against the requested model's
+        // advertised window instead (a model change with no advertised
+        // window honestly disables the ring rather than mis-sizing it).
+        let context_window = if option_sets.iter().any(|(id, _)| id == "model") {
+            requested_model.and_then(|m| model_context_window(&options_snapshot, m))
+        } else {
+            current_window
+        };
+        for (config_id, payload) in option_sets {
             let mut params = serde_json::Map::new();
             params.insert("sessionId".into(), session_id.clone().into());
             params.insert("configId".into(), config_id.clone().into());
@@ -1783,13 +1878,14 @@ async fn run_session(session: Session) {
                 );
             }
         }
-        Ok::<(String, bool, Vec<SlashCommand>), HarnessError>((
+        Ok::<(String, bool, Vec<SlashCommand>, Option<u64>), HarnessError>((
             session_id,
             steer_ext,
             init_commands,
+            context_window,
         ))
     };
-    let (session_id, steer_ext, init_commands) = tokio::select! {
+    let (session_id, steer_ext, init_commands, context_window) = tokio::select! {
         res = tokio::time::timeout(handshake_timeout, setup) => {
             let res = res.unwrap_or_else(|_| {
                 // A hung handshake (agent waiting on a login it can never
@@ -1910,8 +2006,7 @@ async fn run_session(session: Session) {
         prompt_stall.map(|d| tokio::time::Instant::now() + d);
     let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some({
         prompt_seq += 1;
-        current_prompt_id =
-            prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
+        current_prompt_id = prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
         prompt_turn(
             client.clone(),
             session_id.clone(),
@@ -2066,7 +2161,14 @@ async fn run_session(session: Session) {
                     match inc {
                         Incoming::Notification { method, params } => {
                             let events =
-                                session_update_events(&method, &params, &session_id, &mut subagents);
+                                session_update_events_with_context(
+                                    &method,
+                                    &params,
+                                    &session_id,
+                                    &mut subagents,
+                                    harness,
+                                    context_window,
+                                );
                             for ev in events {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -2111,6 +2213,25 @@ async fn run_session(session: Session) {
                 // with it (claude-agent-acp and codex-acp both do).
                 if let Some(usage) = usage_from_response(&res)
                     && !send(&event_tx, usage).await
+                {
+                    break 'main;
+                }
+                // Grok's settled prompt carries the live context total — the
+                // turn-final ring update. A zero total (grok zeroes
+                // `_meta.totalTokens` on cancelled / queue-removed turns)
+                // must not wipe the last known gauge.
+                if let Some(size) = context_window
+                    && let Some(used) = response_total_tokens(&res).filter(|used| *used > 0)
+                    && !send(
+                        &event_tx,
+                        AgentEvent::ContextUsage {
+                            used: used.min(size),
+                            size,
+                            // Same estimate-backed counter the chunks carry.
+                            estimated: true,
+                        },
+                    )
+                    .await
                 {
                     break 'main;
                 }
@@ -2222,7 +2343,14 @@ async fn run_session(session: Session) {
                     // Other notifications (other sessions, agent noise) are
                     // tolerated by design.
                     let events =
-                        session_update_events(&method, &params, &session_id, &mut subagents);
+                        session_update_events_with_context(
+                            &method,
+                            &params,
+                            &session_id,
+                            &mut subagents,
+                            harness,
+                            context_window,
+                        );
                     for ev in events {
                         track_turn_signals(&ev, &mut turn_content_seen, &mut open_tools);
                         if !send(&event_tx, ev).await {
@@ -2334,7 +2462,14 @@ async fn run_session(session: Session) {
                             match inc {
                                 Incoming::Notification { method, params } => {
                                     let events =
-                                        session_update_events(&method, &params, &session_id, &mut subagents);
+                                        session_update_events_with_context(
+                                            &method,
+                                            &params,
+                                            &session_id,
+                                            &mut subagents,
+                                            harness,
+                                            context_window,
+                                        );
                                     for ev in events {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -2798,6 +2933,210 @@ mod tests {
         assert!(!steering_supported(&json!({
             "_meta": { "steering": { "supported": false } },
         })));
+    }
+
+    /// A tracker with no subagent traffic to observe — the context-gauge
+    /// tests never spawn subagents, so an unwatched sink suffices.
+    fn plain_tracker(session_id: &str) -> SubagentTracker {
+        let (tx, _rx) = mpsc::channel(16);
+        SubagentTracker::new(
+            session_id.to_owned(),
+            tx,
+            Some(std::env::temp_dir().join("zeron-acp-tests")),
+        )
+    }
+
+    #[test]
+    fn grok_chunk_total_tokens_feeds_the_context_ring() {
+        let params = json!({
+            "sessionId": "s-1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "pong" },
+                "_meta": { "totalTokens": 13667, "chunkId": 14 },
+            },
+        });
+        let events = session_update_events_with_context(
+            "session/update",
+            &params,
+            "s-1",
+            &mut plain_tracker("s-1"),
+            HarnessId::Grok,
+            Some(200000),
+        );
+        // The chunk counter is marked estimated — never presented as exact.
+        assert!(events.contains(&AgentEvent::ContextUsage {
+            used: 13667,
+            size: 200000,
+            estimated: true,
+        }));
+        // Without a window (session state missing) no ring estimate is
+        // invented.
+        assert!(
+            !session_update_events_with_context(
+                "session/update",
+                &params,
+                "s-1",
+                &mut plain_tracker("s-1"),
+                HarnessId::Grok,
+                None,
+            )
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::ContextUsage { .. }))
+        );
+        // Another session's update never maps.
+        let foreign = json!({
+            "sessionId": "s-other",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "_meta": { "totalTokens": 5 },
+            },
+        });
+        assert!(
+            session_update_events_with_context(
+                "session/update",
+                &foreign,
+                "s-1",
+                &mut plain_tracker("s-1"),
+                HarnessId::Grok,
+                Some(200000),
+            )
+            .is_empty()
+        );
+        // Chunk totals are grok's shape; another harness's chunks with the
+        // same meta stay unmapped.
+        assert!(
+            !session_update_events_with_context(
+                "session/update",
+                &params,
+                "s-1",
+                &mut plain_tracker("s-1"),
+                HarnessId::Codex,
+                Some(200000),
+            )
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::ContextUsage { .. }))
+        );
+        // A mis-reported total above the window is capped, never 318k/200k.
+        let inflated = json!({
+            "sessionId": "s-1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "_meta": { "totalTokens": 318000 },
+            },
+        });
+        assert!(
+            session_update_events_with_context(
+                "session/update",
+                &inflated,
+                "s-1",
+                &mut plain_tracker("s-1"),
+                HarnessId::Grok,
+                Some(200000),
+            )
+            .contains(&AgentEvent::ContextUsage {
+                used: 200000,
+                size: 200000,
+                estimated: true,
+            })
+        );
+        // A zero total is grok's cancelled / queue-removed mis-report — it
+        // must not snap the ring to 0%.
+        let zeroed = json!({
+            "sessionId": "s-1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "_meta": { "totalTokens": 0 },
+            },
+        });
+        assert!(
+            !session_update_events_with_context(
+                "session/update",
+                &zeroed,
+                "s-1",
+                &mut plain_tracker("s-1"),
+                HarnessId::Grok,
+                Some(200000),
+            )
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::ContextUsage { .. }))
+        );
+    }
+
+    #[test]
+    fn grok_prompt_response_context_total_skips_the_billing_ledger() {
+        // Live context total (13667) alongside a per-turn BILLING ledger
+        // (41001 = several model calls summed — each resends the whole
+        // context). The ledger must never feed the context ring.
+        let res: Result<Value, HarnessError> = Ok(json!({
+            "stopReason": "end_turn",
+            "_meta": {
+                "totalTokens": 13667,
+                "inputTokens": 13650,
+                "outputTokens": 17,
+                "usage": { "totalTokens": 41001 },
+            },
+        }));
+        assert_eq!(response_total_tokens(&res), Some(13667));
+        // Without `_meta.totalTokens` the last call's input+output is the
+        // live total.
+        let no_total = json!({
+            "stopReason": "end_turn",
+            "_meta": { "inputTokens": 13650, "outputTokens": 17 },
+        });
+        assert_eq!(response_total_tokens(&Ok(no_total)), Some(13667));
+        // Grok zeroes `_meta.totalTokens` on cancelled turns; the caller
+        // filters that so the last known gauge survives.
+        let cancelled = json!({
+            "stopReason": "cancelled",
+            "_meta": { "totalTokens": 0 },
+        });
+        assert_eq!(response_total_tokens(&Ok(cancelled)), Some(0));
+        // No _meta at all → nothing.
+        assert_eq!(
+            response_total_tokens(&Ok(json!({ "stopReason": "end_turn" }))),
+            None
+        );
+    }
+
+    #[test]
+    fn grok_context_window_reads_the_current_model_state() {
+        let response = json!({
+            "sessionId": "s-1",
+            "models": {
+                "currentModelId": "zai-glm-5-2",
+                "availableModels": [
+                    { "modelId": "grok-4.5", "_meta": { "totalContextTokens": 500000 } },
+                    { "modelId": "zai-glm-5-2", "_meta": { "totalContextTokens": 200000 } },
+                ],
+            },
+        });
+        assert_eq!(grok_context_window(&response), Some(200000));
+        assert_eq!(grok_context_window(&json!({ "sessionId": "s-1" })), None);
+    }
+
+    #[test]
+    fn model_context_window_reads_the_requested_model_not_the_current_one() {
+        // A queued model set means the run leaves `currentModelId` behind:
+        // the ring must be sized by the REQUESTED model's window.
+        let response = json!({
+            "sessionId": "s-1",
+            "models": {
+                "currentModelId": "zai-glm-5-2",
+                "availableModels": [
+                    { "modelId": "grok-4.5", "_meta": { "totalContextTokens": 500000 } },
+                    { "modelId": "zai-glm-5-2", "_meta": { "totalContextTokens": 200000 } },
+                ],
+            },
+        });
+        assert_eq!(model_context_window(&response, "grok-4.5"), Some(500000));
+        // A model with no advertised window honestly yields none — never a
+        // fallback to the current model's (wrong) window.
+        assert_eq!(model_context_window(&response, "grok-4-fast"), None);
+        assert_eq!(
+            model_context_window(&json!({ "sessionId": "s-1" }), "grok-4.5"),
+            None
+        );
     }
 
     #[test]

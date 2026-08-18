@@ -438,6 +438,10 @@ impl WorkspaceDoc {
         row.insert("status", status_str(session.status))?;
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
+        match &session.context_usage {
+            Some(cu) => row.insert("contextUsage", LoroValue::from(serde_json::to_value(cu)?))?,
+            None => row.delete("contextUsage")?,
+        }
         self.doc.commit();
         Ok(())
     }
@@ -684,6 +688,8 @@ pub(crate) struct RawSession {
     started_at: Option<i64>,
     #[serde(default)]
     updated_at: i64,
+    #[serde(default)]
+    context_usage: Option<zeron_proto::ContextUsage>,
 }
 
 impl From<RawSession> for Session {
@@ -694,6 +700,7 @@ impl From<RawSession> for Session {
             status: raw.status,
             started_at: raw.started_at.map(dt),
             updated_at: dt(raw.updated_at),
+            context_usage: raw.context_usage,
         }
     }
 }
@@ -765,6 +772,7 @@ mod tests {
             status,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
+            context_usage: None,
         }
     }
 

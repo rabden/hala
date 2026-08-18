@@ -2225,10 +2225,15 @@ impl Pickers {
     }
 
     /// The composer footer row: checkout-kind + ref, LEFT-aligned, only when
-    /// the picked (or session's) project has git. Device + project moved to
-    /// the new-session canvas ([`Self::render_target_selectors`]); sessions
+    /// the picked (or session's) project has git, plus the context-usage ring
+    /// beside the branch (rendered even without git). Device + project moved
+    /// to the new-session canvas ([`Self::render_target_selectors`]); sessions
     /// name their target in the titlebar.
-    pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub fn render_footer(
+        &mut self,
+        context_ring: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
         // A selected chat whose workspace row hasn't synced yet (the moment
         // right after send mints it) still renders the DRAFT footer — the
@@ -2261,13 +2266,21 @@ impl Pickers {
                 .px(px(10.0))
                 .mb(px(-8.0))
         };
+        // No git chips to anchor against — still surface the context ring
+        // alone, right-aligned where the branch chip would sit.
+        let ring_only = |ring: AnyElement| -> AnyElement {
+            row()
+                .child(div().min_w_0())
+                .child(div().flex().flex_row().items_center().min_w_0().child(ring))
+                .into_any_element()
+        };
 
         if let Some(chat) = &session {
             // Sessions never move: read-only checkout-kind + ref labels,
             // LEFT-aligned, only when the session's project has git. The
             // target (project @ device) lives in the titlebar now.
             let Some(space) = space.as_ref().filter(|s| s.git_detected) else {
-                return None;
+                return context_ring.map(ring_only);
             };
             let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
             let (icon_path, label) = if is_worktree {
@@ -2292,6 +2305,9 @@ impl Pickers {
                 .flex_row()
                 .items_center()
                 .min_w_0()
+                .gap(px(6.0))
+                // Context ring LEFT of the branch label (user request).
+                .children(context_ring)
                 .child(Self::footer_label(
                     crate::icons::GIT_BRANCH,
                     chat.branch
@@ -2307,7 +2323,7 @@ impl Pickers {
         // project live under the canvas logo now).
         let git = space.as_ref().is_some_and(|s| s.git_detected);
         if !git {
-            return None;
+            return context_ring.map(ring_only);
         }
         // Refs feed the draft labels — eager + idempotent.
         self.ensure_refs(false, cx);
@@ -2366,6 +2382,10 @@ impl Pickers {
             .flex_row()
             .items_center()
             .min_w_0()
+            .gap(px(6.0))
+            // Context ring LEFT of the branch chip (user request); the chip
+            // stays rightmost so its popover anchor is unchanged.
+            .children(context_ring)
             .child(attach_overlay_end(
                 ref_chip,
                 &mut overlay,

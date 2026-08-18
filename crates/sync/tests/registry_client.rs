@@ -117,6 +117,7 @@ async fn two_clients_converge_and_stream_live_updates() {
             status: SessionStatus::Working,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
+            context_usage: None,
         })
         .unwrap();
     }
@@ -129,6 +130,93 @@ async fn two_clients_converge_and_stream_live_updates() {
             .unwrap()
             .first()
             .is_some_and(|s| s.status == SessionStatus::Working)
+    })
+    .await;
+
+    client_a.shutdown().await;
+    client_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn context_usage_converges_and_clears_across_clients() {
+    let server = MockRegistryServer::start().await;
+    let doc_a = new_doc("dev-a");
+    let doc_b = new_doc("dev-b");
+
+    {
+        let mut doc = doc_a.lock().unwrap();
+        doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    }
+    let client_a = RegistryClient::connect(&server.url(), doc_a.clone(), "dev-a")
+        .await
+        .expect("a connects");
+    client_a.nudge();
+    wait_until(|| doc_a.lock().unwrap().pending_len() == 0).await;
+
+    let client_b = RegistryClient::connect(&server.url(), doc_b.clone(), "dev-b")
+        .await
+        .expect("b connects");
+    wait_until(|| doc_b.lock().unwrap().read_chats().unwrap().len() == 1).await;
+
+    // A reports a live gauge; B's session row converges on the exact value.
+    {
+        let mut doc = doc_a.lock().unwrap();
+        doc.upsert_session(&Session {
+            chat_id: "chat-1".into(),
+            device_id: "dev-a".into(),
+            status: SessionStatus::Working,
+            started_at: Some(ts(3_000)),
+            updated_at: ts(3_500),
+            context_usage: Some(zeron_proto::ContextUsage {
+                used: 168_000,
+                size: 200_000,
+                estimated: false,
+            }),
+        })
+        .unwrap();
+    }
+    client_a.nudge();
+    wait_until(|| {
+        doc_b
+            .lock()
+            .unwrap()
+            .read_sessions()
+            .unwrap()
+            .first()
+            .is_some_and(|s| {
+                s.context_usage
+                    == Some(zeron_proto::ContextUsage {
+                        used: 168_000,
+                        size: 200_000,
+                        estimated: false,
+                    })
+            })
+    })
+    .await;
+
+    // A clears the gauge (model change / fresh session); the clear — a null
+    // field write, not an omitted one — must reach B too.
+    {
+        let mut doc = doc_a.lock().unwrap();
+        doc.upsert_session(&Session {
+            chat_id: "chat-1".into(),
+            device_id: "dev-a".into(),
+            status: SessionStatus::Idle,
+            started_at: None,
+            updated_at: ts(4_000),
+            context_usage: None,
+        })
+        .unwrap();
+    }
+    client_a.nudge();
+    wait_until(|| {
+        doc_b
+            .lock()
+            .unwrap()
+            .read_sessions()
+            .unwrap()
+            .first()
+            .is_some_and(|s| s.context_usage.is_none())
     })
     .await;
 
@@ -428,6 +516,7 @@ async fn churn_stays_bounded_no_history_growth() {
                 },
                 started_at: Some(ts(i)),
                 updated_at: ts(i + 1),
+                context_usage: None,
             })
             .unwrap();
         }

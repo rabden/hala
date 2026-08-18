@@ -407,9 +407,10 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             }
         }
         // AvailableCommands feeds the engine's per-harness command cache, not
-        // the transcript.
+        // the transcript. ContextUsage feeds live session context indicators.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
+        | AgentEvent::ContextUsage { .. }
         | AgentEvent::AvailableCommands { .. } => {}
     }
 }

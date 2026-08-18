@@ -26,11 +26,13 @@ use zeron_rpc::methods;
 const VIEWER: &str = "viewer-device";
 
 /// Scripted harness: emits SessionStarted + text + Done with a per-event delay (so
-/// `Working` is observable across the bridge).
+/// `Working` is observable across the bridge). `context_usage` additionally emits
+/// a ContextUsage event mid-run (the composer ring's source).
 struct ScriptedHarness {
     id: HarnessId,
     text: &'static str,
     step_delay: Duration,
+    context_usage: Option<(u64, u64)>,
 }
 
 #[async_trait]
@@ -62,24 +64,30 @@ impl Harness for ScriptedHarness {
         let harness = self.id;
         let text = self.text;
         let delay = self.step_delay;
+        let context_usage = self.context_usage;
         tokio::spawn(async move {
-            let script = vec![
-                AgentEvent::SessionStarted {
-                    harness,
-                    model: "scripted-1".into(),
-                    tools: vec![],
-                    cwd: "/tmp".into(),
-                    session_id: "hs-1".into(),
-                    assistant_message_id: "a-1".into(),
-                },
-                AgentEvent::TextDelta { text: text.into() },
-                AgentEvent::Done {
-                    status: DoneStatus::Completed,
-                    result: None,
-                    error: None,
-                    session_id: Some("hs-1".into()),
-                },
-            ];
+            let mut script = vec![AgentEvent::SessionStarted {
+                harness,
+                model: "scripted-1".into(),
+                tools: vec![],
+                cwd: "/tmp".into(),
+                session_id: "hs-1".into(),
+                assistant_message_id: "a-1".into(),
+            }];
+            if let Some((used, size)) = context_usage {
+                script.push(AgentEvent::ContextUsage {
+                    used,
+                    size,
+                    estimated: false,
+                });
+            }
+            script.push(AgentEvent::TextDelta { text: text.into() });
+            script.push(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: Some("hs-1".into()),
+            });
             for event in script {
                 if tx.send(Ok(event)).await.is_err() {
                     return;
@@ -100,11 +108,13 @@ fn registry() -> Arc<HarnessRegistry> {
         id: HarnessId::Mock,
         text: "Hello",
         step_delay: Duration::from_millis(60),
+        context_usage: Some((84_000, 200_000)),
     }));
     registry.register(Arc::new(ScriptedHarness {
         id: HarnessId::Cursor,
         text: "From cursor",
         step_delay: Duration::from_millis(10),
+        context_usage: None,
     }));
     Arc::new(registry)
 }
@@ -539,6 +549,133 @@ async fn chat_config_selects_the_run_harness() {
     a.shutdown().await;
 }
 
+/// The context ring's data flow end to end (issue #137): a ContextUsage event
+/// from the harness lands in the engine's session state (WatchSessions), the
+/// registry row carries it to the second device, and a MODEL change on the
+/// chat config clears the stale measurement everywhere — a gauge sized for
+/// the old model's window must never present as current.
+#[tokio::test]
+async fn context_usage_updates_the_session_watch_and_clears_on_model_change() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let a = assemble(dir_a.path(), "dev-a");
+    let b = assemble(dir_b.path(), "dev-b");
+    let link = bridge(&a, &b).await;
+
+    let client_a = zeron_rpc::memory_client(a.rpc_service());
+    client_a
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "createSpace", "spaceId": "space-ctx", "deviceId": "dev-a", "path": "/tmp"
+            }),
+        )
+        .await
+        .expect("create space");
+    let config = serde_json::json!({
+        "harness": "mock", "model": "scripted-1", "reasoning": null,
+        "modelOptions": {}, "sandbox": "workspace-write"
+    });
+    client_a
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "createChat", "chatId": "chat-ctx", "spaceId": "space-ctx", "config": config
+            }),
+        )
+        .await
+        .expect("create chat");
+    wait_for(
+        || b.workspace.chat("chat-ctx").ok().flatten().is_some(),
+        "chat row on B",
+    )
+    .await;
+
+    // The scripted Mock harness reports a gauge mid-run.
+    queue_run(&a, "chat-ctx", "cmd-ctx-1", "m-1");
+    let gauge = zeron_proto::ContextUsage {
+        used: 84_000,
+        size: 200_000,
+        estimated: false,
+    };
+    // (a) the event updates the engine's live session watch…
+    let mut watch = a.sessions.watch_sessions();
+    wait_for(
+        || {
+            watch
+                .borrow_and_update()
+                .iter()
+                .any(|s| s.chat_id == "chat-ctx" && s.context_usage == Some(gauge))
+        },
+        "gauge in WatchSessions",
+    )
+    .await;
+    // …and the run settles (nothing after Done re-reports the gauge).
+    wait_for(
+        || {
+            watch
+                .borrow()
+                .iter()
+                .any(|s| s.chat_id == "chat-ctx" && s.status == SessionStatus::Idle)
+        },
+        "run settles Idle",
+    )
+    .await;
+
+    // (b) the registry row carries the same value to the second device.
+    wait_for(
+        || {
+            b.workspace
+                .read_sessions()
+                .unwrap_or_default()
+                .iter()
+                .any(|s| s.chat_id == "chat-ctx" && s.context_usage == Some(gauge))
+        },
+        "gauge on B's session row",
+    )
+    .await;
+
+    // (d) A model change clears the stale gauge — locally and on B.
+    client_a
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "setChatConfig", "chatId": "chat-ctx",
+                "config": {
+                    "harness": "mock", "model": "scripted-2", "reasoning": null,
+                    "modelOptions": {}, "sandbox": "workspace-write"
+                }
+            }),
+        )
+        .await
+        .expect("model change");
+    wait_for(
+        || {
+            watch
+                .borrow_and_update()
+                .iter()
+                .any(|s| s.chat_id == "chat-ctx" && s.context_usage.is_none())
+        },
+        "gauge cleared in WatchSessions",
+    )
+    .await;
+    wait_for(
+        || {
+            b.workspace
+                .read_sessions()
+                .unwrap_or_default()
+                .iter()
+                .any(|s| s.chat_id == "chat-ctx" && s.context_usage.is_none())
+        },
+        "gauge cleared on B's session row",
+    )
+    .await;
+
+    drop(link);
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
 /// Live-edge variant: the same convergence through a real workspace room. Requires
 /// the TS edge (`wrangler dev` in `edge/` with AUTH_MODE=dev):
 ///
@@ -672,6 +809,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 status: SessionStatus::Idle,
                 started_at: Some(now),
                 updated_at: now,
+                context_usage: None,
             })
             .unwrap();
         store

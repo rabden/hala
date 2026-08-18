@@ -5514,6 +5514,16 @@ impl Render for Composer {
         self.last_rendered_height = pill_height;
 
         let send_button = self.render_send_button(mode, cx);
+        let context_usage = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat
+                .as_deref()
+                .and_then(|chat_id| state.session_for(chat_id))
+                .and_then(|s| s.context_usage)
+        };
+        let context_ring =
+            context_usage.map(|cu| crate::context_ring::render_context_usage_ring(cu, &theme));
         // Attach button — opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. `ml-1` per the source cluster — chips→attach reads
@@ -5686,10 +5696,11 @@ impl Render for Composer {
         ));
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
-        // labels once the session exists. Git spaces only.
+        // labels once the session exists. Git spaces only. The context ring
+        // rides this row beside the branch (moved out of the pill cluster).
         let footer = self
             .pickers
-            .update(cx, |pickers, cx| pickers.render_footer(cx));
+            .update(cx, |pickers, cx| pickers.render_footer(context_ring, cx));
         let container = match footer {
             Some(footer) => container.child(footer),
             None => container,

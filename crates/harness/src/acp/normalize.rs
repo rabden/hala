@@ -94,11 +94,7 @@ fn tool_diff(update: &Value) -> Option<ToolDiff> {
 /// The grok-native tool name stamped on a tool call's `_meta` (`x.ai/tool`,
 /// present on every grok tool_call — verified live, 1.0.4).
 pub(crate) fn xai_tool_name(update: &Value) -> Option<&str> {
-    update
-        .get("_meta")?
-        .get("x.ai/tool")?
-        .get("name")?
-        .as_str()
+    update.get("_meta")?.get("x.ai/tool")?.get("name")?.as_str()
 }
 
 /// First location path (`locations: [{path, line?}]`), for read/edit calls.
@@ -385,12 +381,26 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             let commands = parse_commands(update.get("availableCommands"));
             vec![AgentEvent::AvailableCommands { commands }]
         }
-        // Context-window gauge, not per-turn input/output tokens — zeron's
-        // Usage event feeds rate-limit probes, so a wrong mapping is worse
-        // than none. Mode/config/session-info updates carry nothing we render.
-        "usage_update" | "current_mode_update" | "config_option_update" | "session_info_update" => {
-            Vec::new()
+        // Context-window gauge (used / size) -> AgentEvent::ContextUsage.
+        // Kept separate from per-turn input/output tokens (AgentEvent::Usage).
+        "usage_update" => {
+            let used = update.get("used").and_then(Value::as_u64);
+            let size = update.get("size").and_then(Value::as_u64);
+            match (used, size) {
+                (Some(used), Some(size)) if size > 0 => {
+                    vec![AgentEvent::ContextUsage {
+                        used,
+                        size,
+                        // ACP's gauge is an exact measurement (grok's chunk
+                        // counter is the estimated one).
+                        estimated: false,
+                    }]
+                }
+                _ => Vec::new(),
+            }
         }
+        // Mode/config/session-info updates carry nothing we render.
+        "current_mode_update" | "config_option_update" | "session_info_update" => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -433,7 +443,6 @@ pub(crate) fn parse_commands(value: Option<&Value>) -> Vec<SlashCommand> {
         })
         .collect()
 }
-
 
 /// `session/request_permission` options (`{optionId, name, kind}`) → the
 /// preferred auto-approve choice: `allow_always` > `allow_once` > first.
@@ -623,6 +632,30 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn usage_update_maps_to_context_usage() {
+        let update = json!({
+            "sessionUpdate": "usage_update",
+            "used": 42000,
+            "size": 200000,
+        });
+        assert_eq!(
+            map_update(&update),
+            vec![AgentEvent::ContextUsage {
+                used: 42000,
+                size: 200000,
+                estimated: false,
+            }]
+        );
+
+        let invalid = json!({
+            "sessionUpdate": "usage_update",
+            "used": 42000,
+            "size": 0,
+        });
+        assert!(map_update(&invalid).is_empty());
     }
 
     #[test]

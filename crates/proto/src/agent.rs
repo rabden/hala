@@ -289,6 +289,17 @@ pub enum AgentEvent {
         input_tokens: u64,
         output_tokens: u64,
     },
+    /// Live context-window consumption (ACP `usage_update`); never persisted to transcript docs.
+    #[serde(rename_all = "camelCase")]
+    ContextUsage {
+        used: u64,
+        size: u64,
+        /// Estimate marker (grok's chunk counter) — carried through to the
+        /// session's `ContextUsage` so the ring can render `~`. Defaulted
+        /// for old-wire compatibility.
+        #[serde(default)]
+        estimated: bool,
+    },
     /// The agent advertised (or changed) its slash-command set — ACP
     /// `available_commands_update`. The engine caches the latest list per
     /// harness for the composer's `/` popup; never persisted to docs.
@@ -348,6 +359,27 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+
+        let context_ev = AgentEvent::ContextUsage {
+            used: 42_000,
+            size: 200_000,
+            estimated: true,
+        };
+        let json = serde_json::to_string(&context_ev).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AgentEvent>(&json).unwrap(),
+            context_ev
+        );
+        // Old-wire JSON without the flag parses (additive compat).
+        let legacy = r#"{"type":"contextUsage","used":42,"size":200}"#;
+        assert_eq!(
+            serde_json::from_str::<AgentEvent>(legacy).unwrap(),
+            AgentEvent::ContextUsage {
+                used: 42,
+                size: 200,
+                estimated: false
+            }
+        );
     }
 
     #[test]

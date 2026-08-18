@@ -7,9 +7,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
-use zeron_harness::{
-    AcpHarness, CancellationToken, Harness, RunControls, SteerMessage,
-};
+use zeron_harness::{AcpHarness, CancellationToken, Harness, RunControls, SteerMessage};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, SteeringMode, TodoItem, ToolCall,
     UserInputAnswer,
@@ -227,6 +225,52 @@ async fn config_options_apply_requested_model_and_effort() {
     );
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
+
+#[tokio::test]
+async fn grok_context_ring_maps_live_totals_not_the_billing_ledger() {
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(&harness(), request("scenario:grok-context"), controls).await;
+    // Grok's context shape: chunk `_meta.totalTokens` mid-turn (ring) and
+    // the settled prompt's LIVE `_meta.totalTokens` at the end — sized to
+    // the model's advertised window. The fixture's currentModelId is
+    // grok-4-fast (no advertised window) while the test requests grok-4.5
+    // (200k), so these events prove the window follows the REQUESTED
+    // model, not the session's boot-time current. The fixture's
+    // `_meta.usage` is a per-turn billing ledger totaling 41001 across
+    // several model calls; it must never feed the ring (the 318k/200k
+    // nonsense).
+    let ring = events
+        .iter()
+        .filter(|ev| matches!(ev, AgentEvent::ContextUsage { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ring,
+        vec![
+            &AgentEvent::ContextUsage {
+                used: 5174,
+                size: 200000,
+                estimated: true,
+            },
+            &AgentEvent::ContextUsage {
+                used: 6000,
+                size: 200000,
+                estimated: true,
+            },
+            &AgentEvent::ContextUsage {
+                used: 13667,
+                size: 200000,
+                estimated: true,
+            },
+        ],
+        "{events:?}"
+    );
+    assert!(
+        ring.iter()
+            .all(|ev| matches!(ev, AgentEvent::ContextUsage { used, size, .. } if used <= size)),
+        "{events:?}"
+    );
+}
+
 #[tokio::test]
 async fn permission_requests_auto_accept_the_preferred_allow_option() {
     let (controls, _steer, _token) = controls();
@@ -764,8 +808,9 @@ async fn grok_subagent_lifecycle_tails_the_disk_transcript_into_tagged_events() 
         )
     })
     .expect("tool result tailed");
-    let text = pos(&|e| matches!(e, AgentEvent::TextDelta { text } if text.starts_with("two files")))
-        .expect("mid-run append tailed");
+    let text =
+        pos(&|e| matches!(e, AgentEvent::TextDelta { text } if text.starts_with("two files")))
+            .expect("mid-run append tailed");
     let done = pos(&|e| {
         matches!(
             e,

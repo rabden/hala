@@ -1082,13 +1082,23 @@ impl RegistryDoc {
     /// Upsert a session-status row (writer discipline: each device writes only
     /// its own runs' rows). Staleness is checked client-side via `updatedAt`.
     pub fn upsert_session(&mut self, session: &Session) -> Result<(), DocError> {
-        let set = fields([
+        let mut set = fields([
             ("chatId", json!(session.chat_id)),
             ("deviceId", json!(session.device_id)),
             ("status", serde_json::to_value(session.status)?),
             ("startedAt", opt_ms(session.started_at)),
             ("updatedAt", json!(session.updated_at.timestamp_millis())),
         ]);
+        // Null deletes the field (`RowOp` contract), so a CLEARED gauge
+        // propagates instead of sticking on remote devices — mirrors the
+        // legacy Loro writer's delete-on-None.
+        set.insert(
+            "contextUsage".into(),
+            match &session.context_usage {
+                Some(cu) => serde_json::to_value(cu)?,
+                None => Value::Null,
+            },
+        );
         self.write(KIND_SESSIONS, &session.chat_id.clone(), OpKind::Upsert, set);
         Ok(())
     }

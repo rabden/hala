@@ -94,6 +94,13 @@ struct RoutedSteer {
     message_id: String,
 }
 
+/// Dead-band state for one chat's context-usage row mirror.
+#[derive(Clone, Copy)]
+struct ContextMirror {
+    usage: zeron_proto::ContextUsage,
+    at: std::time::Instant,
+}
+
 struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
@@ -116,6 +123,11 @@ struct Inner {
     /// (zeron kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
+    /// Last context-usage value mirrored into the workspace doc per chat.
+    /// Grok reports the gauge on EVERY streaming chunk, and a registry row
+    /// write per chunk is the chatty pattern `touch_session` throttles —
+    /// this is the dead-band state for the mirror (see `set_context_usage`).
+    context_mirrors: Mutex<HashMap<String, ContextMirror>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
@@ -155,6 +167,7 @@ impl SessionsEngine {
                 sessions_tx,
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
+                context_mirrors: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
             }),
@@ -371,6 +384,13 @@ impl SessionsEngine {
         if request.resume.is_none() {
             request.resume = self.inner.resume_for(chat_id, &request.cwd);
             resume_injected = request.resume.is_some();
+        }
+        // Fresh harness session = no known context: the previous run's gauge
+        // is a stale measurement of a conversation this session does not
+        // have, so it must not present as current (issue #137). Resumed
+        // sessions keep it — the context carries over with the session id.
+        if request.resume.is_none() {
+            self.inner.set_context_usage(chat_id, None);
         }
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
 
@@ -722,6 +742,17 @@ impl SessionsEngine {
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
         self.inner.set_status(chat_id, status, fresh_start);
     }
+
+    /// Replace (or clear) the chat's context-window gauge. The SetChatConfig
+    /// path uses this to drop stale measurements after a model/harness
+    /// change; `drive_run` writes live reports through it.
+    pub(crate) fn set_context_usage(
+        &self,
+        chat_id: &str,
+        context_usage: Option<zeron_proto::ContextUsage>,
+    ) {
+        self.inner.set_context_usage(chat_id, context_usage);
+    }
 }
 
 impl Inner {
@@ -786,6 +817,7 @@ impl Inner {
                     status,
                     started_at: None,
                     updated_at: now,
+                    context_usage: None,
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
             // "this turn". Entering Working from a settled state always
@@ -819,6 +851,66 @@ impl Inner {
         // Mirror the transition into the workspace doc's session-status row so
         // remote devices' sidebars show this run (staleness-checked client-side).
         if let Some(ws) = self.workspace() {
+            ws.record_session(&session);
+        }
+    }
+
+    fn set_context_usage(&self, chat_id: &str, context_usage: Option<zeron_proto::ContextUsage>) {
+        // Mirror dead-band (the `touch_session` lesson: grok reports the
+        // gauge on every streaming chunk, and a registry row write per chunk
+        // would be far too chatty): the workspace-doc mirror only moves when
+        // the gauge crosses 1% of the window or 10s have passed. The
+        // in-memory session and the WatchSessions stream always track live
+        // so the composer ring stays current, and clears always propagate.
+        const MIRROR_DEADBAND: f64 = 0.01;
+        const MIRROR_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+        let now = Utc::now();
+        let session = {
+            let mut statuses = lock(&self.statuses);
+            let entry = statuses
+                .entry(chat_id.to_string())
+                .or_insert_with(|| Session {
+                    chat_id: chat_id.to_string(),
+                    device_id: self.device_id.clone(),
+                    status: SessionStatus::Idle,
+                    started_at: None,
+                    updated_at: now,
+                    context_usage: None,
+                });
+            entry.context_usage = context_usage;
+            entry.updated_at = now;
+            let session = entry.clone();
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            session
+        };
+        let mirror = match context_usage {
+            // A clear is a state transition, never noise.
+            None => {
+                lock(&self.context_mirrors).remove(chat_id);
+                true
+            }
+            Some(usage) => {
+                let mut mirrors = lock(&self.context_mirrors);
+                let due = mirrors.get(chat_id).is_none_or(|last| {
+                    let window = usage.size.max(last.usage.size) as f64;
+                    let moved = (usage.used as f64 - last.usage.used as f64).abs();
+                    moved / window >= MIRROR_DEADBAND || last.at.elapsed() >= MIRROR_MIN_INTERVAL
+                });
+                if due {
+                    mirrors.insert(
+                        chat_id.to_string(),
+                        ContextMirror {
+                            usage,
+                            at: std::time::Instant::now(),
+                        },
+                    );
+                }
+                due
+            }
+        };
+        if mirror && let Some(ws) = self.workspace() {
             ws.record_session(&session);
         }
     }
@@ -1854,6 +1946,20 @@ async fn drive_run(
             }
             AgentEvent::InputResolved { .. } => {
                 inner.set_status(&chat_id, SessionStatus::Working, false);
+            }
+            AgentEvent::ContextUsage {
+                used,
+                size,
+                estimated,
+            } => {
+                inner.set_context_usage(
+                    &chat_id,
+                    Some(zeron_proto::ContextUsage {
+                        used: *used,
+                        size: *size,
+                        estimated: *estimated,
+                    }),
+                );
             }
             _ => {}
         }
