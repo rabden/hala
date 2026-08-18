@@ -1385,27 +1385,45 @@ fn session_update_events(
 /// Grok's session responses carry the current model's context window at
 /// `models.availableModels[]._meta.totalContextTokens`, keyed by
 /// `models.currentModelId`.
-fn grok_context_window(session_response: &Value) -> Option<u64> {
+fn grok_context_window(session_response: &Value, preferred: Option<&str>) -> Option<u64> {
     let models = session_response.get("models")?;
-    let current = models.get("currentModelId").and_then(Value::as_str)?;
-    model_context_window(session_response, current)
-}
-
-/// The advertised context window of a SPECIFIC model id. Used when a model
-/// config-option set is queued: `currentModelId` still names the PREVIOUS
-/// model at `session/new` time, so the ring must be sized against the model
-/// the run asked for, not the one the session booted with.
-fn model_context_window(session_response: &Value, model_id: &str) -> Option<u64> {
-    session_response
-        .get("models")?
-        .get("availableModels")?
-        .as_array()?
-        .iter()
-        .find(|m| m.get("modelId").and_then(Value::as_str) == Some(model_id))
-        .and_then(|m| m.get("_meta"))
-        .and_then(|meta| meta.get("totalContextTokens"))
-        .and_then(Value::as_u64)
-        .filter(|size| *size > 0)
+    // Wire shapes seen across grok builds: the window rides `_meta`
+    // (`totalContextTokens`) or the model object itself, under either
+    // spelling. Accept all placements; filter zero/absent.
+    let window_for = |model_id: &str| -> Option<u64> {
+        let window = models
+            .get("availableModels")?
+            .as_array()?
+            .iter()
+            .find(|m| m.get("modelId").and_then(Value::as_str) == Some(model_id))
+            .and_then(|m| {
+                m.get("_meta")
+                    .or(Some(m))
+                    .and_then(|meta| meta.get("totalContextTokens"))
+                    .or_else(|| m.get("contextWindow"))
+                    .and_then(Value::as_u64)
+            })
+            .filter(|size| *size > 0);
+        if window.is_none() {
+            tracing::debug!(
+                target: "zeron_harness::acp",
+                model = model_id,
+                "grok session state carries no context window; ring disabled until a window is advertised"
+            );
+        }
+        window
+    };
+    // The preferred model (the one a config set is about to make current)
+    // wins; an unlisted/unknown id falls back to the session's current.
+    preferred
+        .filter(|m| !m.is_empty())
+        .and_then(window_for)
+        .or_else(|| {
+            models
+                .get("currentModelId")
+                .and_then(Value::as_str)
+                .and_then(window_for)
+        })
 }
 
 /// [`session_update_events`] plus grok's live context gauge: grok emits no
@@ -1828,33 +1846,43 @@ async fn run_session(session: Session) {
                 "session/new returned no sessionId".into(),
             ));
         }
-        // Grok's model state rides the session response — the current
-        // model's context window sizes the ContextUsage ring events.
-        // Computed before the snapshot move below; a queued model set may
-        // override it with the REQUESTED model's window.
-        let current_window = grok_context_window(&session_response);
         // Apply the run's model + effort + model options through the
         // session's advertised config options (ACP has no per-prompt model
         // field). Best-effort: a rejected set is logged, never fatal — the
         // agent's default runs.
         let efforts = effort_values(request.reasoning, request.model.as_deref());
         let requested_model = request.model.as_deref();
-        let mut options_snapshot = session_response;
+        let options_snapshot = session_response;
         let option_sets = config_option_sets(
             &options_snapshot,
             requested_model,
             &efforts,
             &request.model_options,
         );
-        // A queued model set means the run will NOT run under
-        // `currentModelId` — size the ring against the requested model's
-        // advertised window instead (a model change with no advertised
-        // window honestly disables the ring rather than mis-sizing it).
-        let context_window = if option_sets.iter().any(|(id, _)| id == "model") {
-            requested_model.and_then(|m| model_context_window(&options_snapshot, m))
-        } else {
-            current_window
-        };
+        // Grok's model state rides the session response — but the session's
+        // `currentModelId` predates the config sets below. When a model set
+        // is queued, the window must come from the model that WILL be
+        // current (the requested one), not the one the session booted with.
+        let model_option_id = options_snapshot
+            .get("configOptions")
+            .and_then(Value::as_array)
+            .and_then(|opts| {
+                opts.iter()
+                    .find(|o| {
+                        o.get("type").and_then(Value::as_str) == Some("select")
+                            && o.get("category").and_then(Value::as_str) == Some("model")
+                    })
+                    .and_then(|o| o.get("id").and_then(Value::as_str))
+            });
+        let effective_model = model_option_id
+            .zip(requested_model)
+            .and_then(|(id, model)| {
+                option_sets
+                    .iter()
+                    .any(|(config_id, _)| config_id == id)
+                    .then_some(model)
+            });
+        let context_window = grok_context_window(&options_snapshot, effective_model);
         for (config_id, payload) in option_sets {
             let mut params = serde_json::Map::new();
             params.insert("sessionId".into(), session_id.clone().into());
@@ -3100,7 +3128,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_context_window_reads_the_current_model_state() {
+    fn grok_context_window_reads_the_effective_model_state() {
         let response = json!({
             "sessionId": "s-1",
             "models": {
@@ -3111,30 +3139,22 @@ mod tests {
                 ],
             },
         });
-        assert_eq!(grok_context_window(&response), Some(200000));
-        assert_eq!(grok_context_window(&json!({ "sessionId": "s-1" })), None);
-    }
-
-    #[test]
-    fn model_context_window_reads_the_requested_model_not_the_current_one() {
-        // A queued model set means the run leaves `currentModelId` behind:
-        // the ring must be sized by the REQUESTED model's window.
-        let response = json!({
-            "sessionId": "s-1",
-            "models": {
-                "currentModelId": "zai-glm-5-2",
-                "availableModels": [
-                    { "modelId": "grok-4.5", "_meta": { "totalContextTokens": 500000 } },
-                    { "modelId": "zai-glm-5-2", "_meta": { "totalContextTokens": 200000 } },
-                ],
-            },
-        });
-        assert_eq!(model_context_window(&response, "grok-4.5"), Some(500000));
-        // A model with no advertised window honestly yields none — never a
-        // fallback to the current model's (wrong) window.
-        assert_eq!(model_context_window(&response, "grok-4-fast"), None);
+        // No preferred model → the session's current one.
+        assert_eq!(grok_context_window(&response, None), Some(200000));
+        // A preferred model (the run switches to it) wins over currentModelId —
+        // the session response predates the config sets that apply the switch.
         assert_eq!(
-            model_context_window(&json!({ "sessionId": "s-1" }), "grok-4.5"),
+            grok_context_window(&response, Some("grok-4.5")),
+            Some(500000)
+        );
+        // Unknown / empty preferred falls back to the current model.
+        assert_eq!(
+            grok_context_window(&response, Some("missing-model")),
+            Some(200000)
+        );
+        assert_eq!(grok_context_window(&response, Some("")), Some(200000));
+        assert_eq!(
+            grok_context_window(&json!({ "sessionId": "s-1" }), None),
             None
         );
     }

@@ -258,6 +258,13 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
             )
         })
         .expect("usage emitted");
+    // The live context gauge (exact: last.totalTokens + modelContextWindow)
+    // flows through the same notification, live rather than turn-held.
+    assert!(events.contains(&AgentEvent::ContextUsage {
+        used: 49,
+        size: 128_000,
+        estimated: false
+    }));
     let done_pos = events
         .iter()
         .position(|e| matches!(e, AgentEvent::Done { .. }))

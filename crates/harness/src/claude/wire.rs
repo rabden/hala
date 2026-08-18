@@ -141,6 +141,8 @@ pub(crate) struct ResultFrame {
     pub errors: Vec<Value>,
     #[serde(default)]
     pub usage: UsageBody,
+    #[serde(default, rename = "modelUsage")]
+    pub model_usage: Option<Value>,
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -151,6 +153,38 @@ pub(crate) struct UsageBody {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+}
+
+impl UsageBody {
+    /// The turn's true context consumption: everything the model was fed
+    /// (input + both cache tiers count against the window) plus what it
+    /// produced. This is what Claude Code's own `/context` bar measures.
+    pub fn context_consumption(&self) -> u64 {
+        self.input_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+            + self.output_tokens
+    }
+}
+
+/// The model's advertised context window from a result frame's `modelUsage`
+/// (keyed by model id; `contextWindow` on the entry). Any entry wins — the
+/// map is single-model in practice.
+pub(crate) fn result_context_window(model_usage: &Option<Value>) -> Option<u64> {
+    model_usage
+        .as_ref()?
+        .as_object()?
+        .values()
+        .find_map(|entry| {
+            entry
+                .get("contextWindow")
+                .and_then(Value::as_u64)
+                .filter(|size| *size > 0)
+        })
 }
 
 /// A CLI→client control request (`can_use_tool` is the one we act on).

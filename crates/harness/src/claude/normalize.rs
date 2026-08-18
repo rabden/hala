@@ -4,7 +4,7 @@
 use serde_json::Value;
 use zeron_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
 
-use super::wire::{ContentBlock, Frame};
+use super::wire::{ContentBlock, Frame, result_context_window};
 
 /// Human-readable text for the CLI's assistant-level error codes. These arrive
 /// as a terse `error` field on an `assistant` frame — usually with NO text
@@ -404,10 +404,24 @@ impl Normalizer {
                 if let Some(id) = &f.session_id {
                     self.session_id = Some(id.clone());
                 }
-                let usage = AgentEvent::Usage {
+                // Turn-end context gauge (exact, agent-reported): the result
+                // frame's usage includes both cache tiers — the true window
+                // fill — and modelUsage carries the model's contextWindow.
+                let mut events = Vec::new();
+                let used = f.usage.context_consumption();
+                if let Some(size) = result_context_window(&f.model_usage)
+                    && used > 0
+                {
+                    events.push(AgentEvent::ContextUsage {
+                        used: used.min(size),
+                        size,
+                        estimated: false,
+                    });
+                }
+                events.push(AgentEvent::Usage {
                     input_tokens: f.usage.input_tokens,
                     output_tokens: f.usage.output_tokens,
-                };
+                });
                 let done = if f.subtype == "success" {
                     AgentEvent::Done {
                         status: if interrupted {
@@ -469,7 +483,8 @@ impl Normalizer {
                         session_id: f.session_id,
                     }
                 };
-                vec![usage, done]
+                events.push(done);
+                events
             }
 
             // Control frames are handled by the run loop, not normalized.
@@ -537,6 +552,35 @@ mod tests {
         let events = normalize_one(raw);
         assert_eq!(events.len(), 2, "usage + done");
         events.into_iter().nth(1).expect("done event")
+    }
+
+    #[test]
+    fn result_frame_emits_the_context_gauge_when_the_window_is_reported() {
+        // Live shape (2.1.228): usage carries both cache tiers, modelUsage
+        // the model's contextWindow. The gauge is exact and rides ahead of
+        // the Usage/Done pair.
+        let raw = r#"{"type":"result","subtype":"success","result":"ok","errors":[],"usage":{"input_tokens":10,"cache_creation_input_tokens":2000,"cache_read_input_tokens":30000,"output_tokens":20},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":10,"outputTokens":20,"contextWindow":200000}},"session_id":"s-1"}"#;
+        let events = normalize_one(raw);
+        assert_eq!(events.len(), 3, "gauge + usage + done");
+        assert_eq!(
+            events[0],
+            AgentEvent::ContextUsage {
+                used: 32_030,
+                size: 200_000,
+                estimated: false
+            }
+        );
+    }
+
+    #[test]
+    fn result_frame_without_window_emits_no_gauge() {
+        // Older/no-modelUsage shapes: usage + done only, never a guessed ring.
+        let raw = r#"{"type":"result","subtype":"success","result":"ok","errors":[],"usage":{"input_tokens":10,"cache_creation_input_tokens":2000,"cache_read_input_tokens":30000,"output_tokens":20},"session_id":"s-1"}"#;
+        let events = normalize_one(raw);
+        assert_eq!(events.len(), 2, "usage + done");
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextUsage { .. })));
     }
 
     #[test]

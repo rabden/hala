@@ -61,8 +61,8 @@ use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
-    ChildRoute, Phase, delta_text, item_id, item_type, map_item, notification_thread_id,
-    route_child_notification, turn_error_message, turn_id, usage_event,
+    ChildRoute, Phase, context_gauge_event, delta_text, item_id, item_type, map_item,
+    notification_thread_id, route_child_notification, turn_error_message, turn_id, usage_event,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
@@ -822,6 +822,14 @@ async fn run_session(session: Session) {
                     "thread/tokenUsage/updated" => {
                         if let Some(usage) = usage_event(&params) {
                             pending_usage = Some(usage);
+                        }
+                        // Live context gauge (exact: agent-reported fill +
+                        // window); flows straight through — the engine
+                        // dead-bands the mirror per #137.
+                        if let Some(gauge) = context_gauge_event(&params)
+                            && !send(&event_tx, gauge).await
+                        {
+                            break 'main;
                         }
                     }
 

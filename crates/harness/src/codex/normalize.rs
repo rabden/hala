@@ -74,6 +74,28 @@ pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
     })
 }
 
+/// `thread/tokenUsage/updated` → the live context gauge (`ContextUsage`).
+/// Codex reports both halves exactly: the last call's context consumption
+/// (`last.totalTokens` — input includes cache-read, so this IS the window
+/// fill) and the model's window (`modelContextWindow`). Emitted live (not
+/// held for Done) so the ring tracks the turn. A zero total is the CLI's
+/// cancel/reset shape — never wipe the last gauge with it.
+pub(crate) fn context_gauge_event(params: &Value) -> Option<AgentEvent> {
+    let usage = field(params, &["tokenUsage", "token_usage"])?;
+    let last = usage.get("last")?;
+    let used = field(last, &["totalTokens", "total_tokens"])
+        .and_then(Value::as_u64)
+        .filter(|used| *used > 0)?;
+    let size = field(usage, &["modelContextWindow", "model_context_window"])
+        .and_then(Value::as_u64)
+        .filter(|size| *size > 0)?;
+    Some(AgentEvent::ContextUsage {
+        used: used.min(size),
+        size,
+        estimated: false,
+    })
+}
+
 /// Tool-shaped Codex items must always close the lifecycle they open: started
 /// opens the ToolCall, completed refreshes its metadata and resolves the same
 /// stable id (port of codex.ts `toolLifecycle`).
@@ -423,8 +445,57 @@ mod tests {
     }
 
     #[test]
-    fn usage_reads_last_snapshot_under_both_spellings() {
+    fn context_gauge_reads_fill_and_window_and_guards_zero() {
+        // Live shape (0.146.1): last.totalTokens is the context fill,
+        // modelContextWindow the model's window — exact, uncapped source.
+        let params = json!({
+            "tokenUsage": {
+                "last": { "totalTokens": 13837, "inputTokens": 13747, "outputTokens": 90 },
+                "modelContextWindow": 258400
+            }
+        });
         assert_eq!(
+            context_gauge_event(&params),
+            Some(AgentEvent::ContextUsage {
+                used: 13837,
+                size: 258400,
+                estimated: false
+            })
+        );
+        // A fill above the window is a mis-report: capped, like grok's.
+        let inflated = json!({
+            "tokenUsage": {
+                "last": { "totalTokens": 300_000 },
+                "modelContextWindow": 258400
+            }
+        });
+        assert_eq!(
+            context_gauge_event(&inflated),
+            Some(AgentEvent::ContextUsage {
+                used: 258400,
+                size: 258400,
+                estimated: false
+            })
+        );
+        // Zero fill (cancel/reset shape) never wipes the last gauge.
+        let zeroed = json!({
+            "tokenUsage": {
+                "last": { "totalTokens": 0 },
+                "modelContextWindow": 258400
+            }
+        });
+        assert_eq!(context_gauge_event(&zeroed), None);
+        // No window advertised → no ring (never guess a denominator).
+        let windowless = json!({
+            "tokenUsage": {
+                "last": { "totalTokens": 13837 }
+            }
+        });
+        assert_eq!(context_gauge_event(&windowless), None);
+    }
+
+    #[test]
+    fn usage_reads_last_snapshot_under_both_spellings() {        assert_eq!(
             usage_event(&json!({"tokenUsage": {"last": {"inputTokens": 42, "outputTokens": 7}}})),
             Some(AgentEvent::Usage {
                 input_tokens: 42,

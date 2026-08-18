@@ -202,6 +202,13 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
         input_tokens: 10,
         output_tokens: 20
     }));
+    // Turn-end context gauge from the result frame: usage including BOTH
+    // cache tiers is the true window fill; modelUsage carries the window.
+    assert!(events.contains(&AgentEvent::ContextUsage {
+        used: 32_030,
+        size: 200_000,
+        estimated: false
+    }));
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {
