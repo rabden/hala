@@ -31,6 +31,13 @@ use zeron_rpc::methods;
 /// pagination plumbing).
 const MAX_REF_ROWS: usize = 300;
 
+// The floating rail geometry is the shared scrollbar widget
+// ([`crate::scrollbar`]); the shared constants are aliased under their
+// picker names so the call sites read unchanged.
+use crate::scrollbar::{
+    HIT_WIDTH as MODEL_SCROLLBAR_HIT_WIDTH, TRACK_INSET as MODEL_SCROLLBAR_TRACK_INSET,
+};
+
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::motion;
 use crate::popover::{self, Loadable, MenuKey};
@@ -416,6 +423,28 @@ struct ModelRowData {
     model: Model,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ModelScrollbarGrab {
+    grab_offset: f32,
+}
+
+/// Marker for GPUI's captured drag stream. The actual grab geometry stays in
+/// [`ModelScrollbarGrab`] so a track click can center the thumb first.
+struct ModelScrollbarDrag;
+
+/// Invisible drag preview: scrollbar drags manipulate the existing thumb.
+struct ModelScrollbarDragGhost;
+
+impl gpui::Render for ModelScrollbarDragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        gpui::Empty
+    }
+}
+
+// Thumb geometry and pointer math are the shared floating-scrollbar widget
+// ([`crate::scrollbar`]) — the same rail the thought boxes use.
+use crate::scrollbar::ThumbMetrics as ModelScrollbarMetrics;
+
 /// Which picker popover is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
@@ -470,8 +499,11 @@ pub struct Pickers {
     model_rows_cache: std::cell::RefCell<Option<(ModelRowsKey, std::sync::Arc<Vec<ModelRowData>>)>>,
     /// Bumped on every catalog/favorites mutation; invalidates the cache.
     catalog_rev: u64,
-    /// Hover/drag state of the floating model-list scrollbar.
-    model_bar: popover::MenuScrollbarState,
+    /// Drag state for the floating model-list scrollbar.
+    model_scrollbar_drag: Option<ModelScrollbarGrab>,
+    /// The scrollbar is an on-demand affordance for the model-list surface.
+    model_list_hovered: bool,
+    model_scrollbar_hovered: bool,
     /// Shared search / URL / name input, reused across popovers.
     search: Entity<ComposerInput>,
     /// One-shot mute for the next Edited event's highlight reset — armed by
@@ -629,7 +661,9 @@ impl Pickers {
             model_scroll: gpui::UniformListScrollHandle::new(),
             model_rows_cache: std::cell::RefCell::new(None),
             catalog_rev: 0,
-            model_bar: popover::MenuScrollbarState::default(),
+            model_scrollbar_drag: None,
+            model_list_hovered: false,
+            model_scrollbar_hovered: false,
             search,
             search_reset_muted: false,
             focus: cx.focus_handle(),
@@ -831,13 +865,6 @@ impl Pickers {
         self.open.as_open().copied()
     }
 
-    /// Whether any picker popover is open (shell-side: session-nav shortcuts
-    /// go quiet underneath an open popover instead of yanking the session out
-    /// from under it).
-    pub fn is_open(&self) -> bool {
-        self.open.as_open().is_some()
-    }
-
     /// The picker to render: open or mid-exit.
     fn mounted_kind(&self) -> Option<PickerKind> {
         self.open.get().copied()
@@ -845,7 +872,9 @@ impl Pickers {
 
     /// Begin the exit animation (shared by every close path).
     fn animate_close(&mut self, cx: &mut Context<Self>) {
-        self.model_bar = popover::MenuScrollbarState::default();
+        self.model_scrollbar_drag = None;
+        self.model_list_hovered = false;
+        self.model_scrollbar_hovered = false;
         if self.open.begin_close() {
             popover::reap_popup(cx, |pickers: &mut Self| &mut pickers.open);
         }
@@ -2340,9 +2369,9 @@ impl Pickers {
             .child(div().min_w_0().truncate().child(label))
     }
 
-    /// The new-session target row — device + project selector chips rendered
-    /// ABOVE the composer pill, left-aligned like the checkout toolbar (the
-    /// composer footer carries only checkout + ref, and sessions show their
+    /// The new-session canvas's target row — device + project selector chips
+    /// under the canvas logo (their popovers anchor BELOW; the composer
+    /// footer carries only checkout + ref now, and sessions show their
     /// target in the titlebar instead).
     pub fn render_target_selectors(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
@@ -2395,25 +2424,19 @@ impl Pickers {
             &theme,
             cx,
         );
-        // Same left-edge geometry as the checkout toolbar under the pill
-        // (`render_footer`'s row): full-width, 10px inset, chips hugging the
-        // left. The row sits just above the composer pill, so the menus open
-        // UPWARD.
         div()
-            .w_full()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(4.0))
-            .px(px(10.0))
-            .child(attach_overlay(
+            .child(attach_overlay_below(
                 device_chip,
                 &mut overlay,
                 PickerKind::Device,
                 "device-popover",
                 closing,
             ))
-            .child(attach_overlay(
+            .child(attach_overlay_below(
                 project_chip,
                 &mut overlay,
                 PickerKind::Space,
@@ -2425,7 +2448,7 @@ impl Pickers {
 
     /// The composer footer row: checkout-kind + ref, LEFT-aligned, only when
     /// the picked (or session's) project has git. Device + project moved to
-    /// the row above the pill ([`Self::render_target_selectors`]); sessions
+    /// the new-session canvas ([`Self::render_target_selectors`]); sessions
     /// name their target in the titlebar.
     pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
@@ -2514,8 +2537,8 @@ impl Pickers {
             return Some(row().child(left).child(right).into_any_element());
         }
 
-        // New-session draft: checkout + ref only, LEFT-aligned (device +
-        // project live in the row above the pill now).
+        // New-session canvas: checkout + ref only, LEFT-aligned (device +
+        // project live under the canvas logo now).
         let git = space.as_ref().is_some_and(|s| s.git_detected);
         if !git {
             return None;
@@ -2532,7 +2555,7 @@ impl Pickers {
                 let content = self.render_checkout_popover(cx);
                 Some((PickerKind::Checkout, self.popover_frame(224.0, content, cx)))
             }
-            // Space/Device popovers mount on the target row above the pill
+            // Space/Device popovers mount on the canvas selectors
             // (`render_target_selectors`), not here.
             _ => None,
         };
@@ -2674,15 +2697,59 @@ impl Pickers {
         self.model_scroll.0.borrow().base_handle.clone()
     }
 
+    fn model_scrollbar_metrics(&self) -> Option<ModelScrollbarMetrics> {
+        let scroll = self.model_scroll_base();
+        let bounds = scroll.bounds();
+        let viewport_height = f32::from(bounds.size.height);
+        // GPUI stores the maximum as a positive distance; only the live
+        // scroll offset is negative while content moves upward.
+        let max_scroll = f32::from(scroll.max_offset().y).max(0.0);
+        if viewport_height <= 0.0 || max_scroll <= 0.0 {
+            return None;
+        }
+        let current_scroll = (-f32::from(scroll.offset().y)).clamp(0.0, max_scroll);
+        // The shared math wants content height; the list knows only its
+        // overflow distance (content = viewport + max scroll).
+        crate::scrollbar::metrics_for(
+            current_scroll,
+            viewport_height + max_scroll,
+            viewport_height,
+        )
+    }
+
+    fn model_scrollbar_to_pointer(
+        &mut self,
+        pointer_y: gpui::Pixels,
+        grab_offset: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(metrics) = self.model_scrollbar_metrics() else {
+            return;
+        };
+        let scroll = self.model_scroll_base();
+        let bounds = scroll.bounds();
+        let pointer_in_track = f32::from(pointer_y - bounds.top()) - MODEL_SCROLLBAR_TRACK_INSET;
+        let scroll_to =
+            crate::scrollbar::scroll_for_pointer(pointer_in_track, grab_offset, metrics);
+        let offset = scroll.offset();
+        scroll.set_offset(gpui::Point::new(offset.x, px(-scroll_to)));
+        cx.notify();
+    }
+
     fn on_model_list_hover(
         &mut self,
         hovered: &bool,
         _window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
-        if self.model_bar.set_list_hovered(*hovered) {
-            cx.notify();
+        if self.model_list_hovered == *hovered {
+            return;
         }
+        self.model_list_hovered = *hovered;
+        if !*hovered && self.model_scrollbar_drag.is_none() {
+            self.model_scrollbar_hovered = false;
+        }
+        cx.notify();
     }
 
     fn on_model_scrollbar_hover(
@@ -2691,7 +2758,11 @@ impl Pickers {
         _window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
-        if self.model_bar.set_bar_hovered(*hovered) {
+        // Keep the active treatment while a captured drag travels outside the
+        // model list; the hover callback quite correctly turns false there.
+        let active = *hovered || self.model_scrollbar_drag.is_some();
+        if self.model_scrollbar_hovered != active {
+            self.model_scrollbar_hovered = active;
             cx.notify();
         }
     }
@@ -2702,25 +2773,29 @@ impl Pickers {
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
-        let scroll = self.model_scroll_base();
-        if !self.model_bar.begin_press(&scroll, event.position.y) {
+        let Some(metrics) = self.model_scrollbar_metrics() else {
             return;
-        }
+        };
         window.focus(&self.focus, cx);
+        let bounds = self.model_scroll_base().bounds();
+        let pointer_in_track =
+            f32::from(event.position.y - bounds.top()) - MODEL_SCROLLBAR_TRACK_INSET;
+        let grab_offset = crate::scrollbar::grab_offset_for(pointer_in_track, &metrics);
+        self.model_scrollbar_drag = Some(ModelScrollbarGrab { grab_offset });
+        self.model_scrollbar_to_pointer(event.position.y, grab_offset, cx);
         cx.stop_propagation();
-        cx.notify();
     }
 
     fn on_model_scrollbar_drag_move(
         &mut self,
-        event: &gpui::DragMoveEvent<popover::MenuScrollbarDrag>,
+        event: &gpui::DragMoveEvent<ModelScrollbarDrag>,
         _window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
-        let scroll = self.model_scroll_base();
-        if self.model_bar.drag_to(&scroll, event.event.position.y) {
-            cx.notify();
-        }
+        let Some(drag) = self.model_scrollbar_drag else {
+            return;
+        };
+        self.model_scrollbar_to_pointer(event.event.position.y, drag.grab_offset, cx);
     }
 
     fn on_model_scrollbar_mouse_up(
@@ -2729,7 +2804,10 @@ impl Pickers {
         _window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
-        self.model_bar.end_press();
+        self.model_scrollbar_drag = None;
+        if !self.model_list_hovered {
+            self.model_scrollbar_hovered = false;
+        }
         cx.notify();
     }
 
@@ -2738,19 +2816,28 @@ impl Pickers {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        let metrics = self.model_bar.metrics(&self.model_scroll_base())?;
+        let dragging = self.model_scrollbar_drag.is_some();
+        if !self.model_list_hovered && !dragging {
+            return None;
+        }
+        let metrics = self.model_scrollbar_metrics()?;
+        let active = self.model_scrollbar_hovered || dragging;
         Some(
-            self.model_bar
-                .render_rail(theme, metrics)?
+            div()
                 .id("model-scrollbar")
+                .absolute()
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .right(px(0.0))
+                .w(px(MODEL_SCROLLBAR_HIT_WIDTH))
                 .on_hover(cx.listener(Self::on_model_scrollbar_hover))
                 .on_mouse_down(
                     gpui::MouseButton::Left,
                     cx.listener(Self::on_model_scrollbar_mouse_down),
                 )
-                .on_drag(popover::MenuScrollbarDrag, |_, _, _, cx| {
+                .on_drag(ModelScrollbarDrag, |_, _, _, cx| {
                     cx.stop_propagation();
-                    cx.new(|_| popover::MenuScrollbarDragGhost)
+                    cx.new(|_| ModelScrollbarDragGhost)
                 })
                 .on_mouse_up_out(
                     gpui::MouseButton::Left,
@@ -2760,6 +2847,7 @@ impl Pickers {
                     gpui::MouseButton::Left,
                     cx.listener(Self::on_model_scrollbar_mouse_up),
                 )
+                .child(crate::scrollbar::thumb(&metrics, active, theme))
                 .into_any_element(),
         )
     }
@@ -3782,6 +3870,23 @@ fn attach_overlay(
         && let Some((_, element)) = overlay.take()
     {
         return chip.child(popover::anchored_menu_above(id, element, closing));
+    }
+    chip
+}
+
+/// [`attach_overlay`] opening DOWNWARD — the canvas target selectors sit
+/// mid-screen, so their menus drop below the chips.
+fn attach_overlay_below(
+    chip: gpui::Stateful<gpui::Div>,
+    overlay: &mut Option<(PickerKind, AnyElement)>,
+    kind: PickerKind,
+    id: &'static str,
+    closing: Option<std::time::Instant>,
+) -> gpui::Stateful<gpui::Div> {
+    if overlay.as_ref().is_some_and(|(k, _)| *k == kind)
+        && let Some((_, element)) = overlay.take()
+    {
+        return chip.child(popover::anchored_menu_below(id, element, closing));
     }
     chip
 }

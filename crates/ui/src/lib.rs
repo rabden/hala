@@ -31,6 +31,7 @@ pub mod notify;
 pub mod pickers;
 pub mod popover;
 pub mod rail;
+pub mod scrollbar;
 pub mod settings;
 pub mod shell;
 pub mod sound;

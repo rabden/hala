@@ -387,22 +387,14 @@ fn wrap_thought_lines(text: &str) -> Vec<SharedString> {
     lines
 }
 
-/// A reasoning part as a tool-group chip: "Thought process" header over the
-/// wrapped thought text as an output-style detail (analytic height — the
-/// group's fold tween needs it). Capped like tool outputs, with the counted
-/// tail. `live` = the part is still streaming (chip defaults open).
+/// A reasoning part as a tool-group chip: a live/settled header over the
+/// wrapped thought text as a bounded SCROLLBOX detail (waku's reasoning
+/// peek) — the full text, never truncated; overflow scrolls and follows the
+/// stream tail while live. Analytic heights still hold (the box clamps at
+/// [`THOUGHT_MAX_H`]), so the group's fold tween keeps working. `live` = the
+/// part is still streaming (chip defaults open).
 fn thought_item(text: &str, live: bool) -> ToolItem {
-    let mut lines = wrap_thought_lines(text);
-    let truncated_by = lines.len().saturating_sub(OUTPUT_DETAIL_MAX_LINES);
-    if truncated_by > 0 {
-        // Keep the TAIL while streaming (the fresh thinking is the signal);
-        // settled thoughts keep the head like tool outputs do.
-        if live {
-            lines.drain(..truncated_by);
-        } else {
-            lines.truncate(OUTPUT_DETAIL_MAX_LINES);
-        }
-    }
+    let lines = wrap_thought_lines(text);
     ToolItem {
         call: ToolCall::Unknown {
             name: "Thought process".into(),
@@ -410,10 +402,7 @@ fn thought_item(text: &str, live: bool) -> ToolItem {
         },
         is_error: false,
         resolved: !live,
-        detail: Some(Arc::new(ToolDetail::Output {
-            lines,
-            truncated_by,
-        })),
+        detail: Some(Arc::new(ToolDetail::Thought { lines })),
         invocation: None,
         output_ref: None,
         output_bytes: None,
@@ -448,6 +437,11 @@ pub enum ToolDetail {
     Stats {
         stats: Arc<Vec<zeron_doc::ToolDiffStat>>,
     },
+    /// A REASONING part's full word-wrapped text — deliberately NEVER
+    /// truncated: the body renders inside a bounded scrollbox that follows
+    /// the stream tail (waku's reasoning peek), so length costs scroll, not
+    /// lost context. UI-synthesized only; never built from a doc tool part.
+    Thought { lines: Vec<SharedString> },
 }
 
 /// Max verbatim output lines per chip before the counted tail row.
@@ -461,6 +455,14 @@ pub const DIFF_DETAIL_MAX_LINES: usize = 600;
 /// Per-line height of an output detail block (diff blocks use the changes
 /// pane's own [`crate::changes::DIFF_LINE_HEIGHT`]).
 pub const OUTPUT_LINE_HEIGHT: f32 = 18.0;
+
+/// Max height of a thought's scrollbox body (waku's reasoning peek cap).
+/// Longer thinking scrolls instead of truncating — the full text stays
+/// reachable in both directions at any length.
+pub const THOUGHT_MAX_H: f32 = 400.0;
+
+// The floating rail inside the thought scrollbox shares the model picker's
+// scrollbar widget — geometry and pointer math live in [`crate::scrollbar`].
 
 /// Vertical padding of an output detail body (py(6) × 2).
 const OUTPUT_BODY_PAD: f32 = 12.0;
@@ -799,6 +801,17 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
                     acc.extend_from_slice(stat.path.as_bytes());
                     acc.extend_from_slice(&stat.additions.to_le_bytes());
                     acc.extend_from_slice(&stat.deletions.to_le_bytes());
+                }
+            }
+            // A thought's text GROWS while it streams and nothing else about
+            // the chip flips — hash the line BYTES (not just their count and
+            // total) so even a same-length rewrite re-splices the row.
+            Some(ToolDetail::Thought { lines }) => {
+                acc.push(4);
+                acc.extend_from_slice(&(lines.len() as u32).to_le_bytes());
+                for line in lines.iter() {
+                    acc.extend_from_slice(line.as_bytes());
+                    acc.push(b'\n');
                 }
             }
         }
@@ -1331,6 +1344,206 @@ pub fn tool_group_summary(tools: &[ToolItem]) -> String {
     }
 }
 
+/// Basename of a path-ish display target — waku's `activity_path_name`. A
+/// fixed-width chip reads "Edited main.rs" better than a repo-relative path.
+fn file_leaf(path: &str) -> &str {
+    let path = path.trim();
+    path.rsplit(['/', '\\'])
+        .find(|leaf| !leaf.is_empty())
+        .unwrap_or(path)
+}
+
+/// Humanize a raw provider/MCP tool name ("web_search", "mcp__gh__list_prs",
+/// "TodoWrite") into words: leaf after `__`/`:`/`/`, snake and camel case
+/// split, capitalized. Names that already carry whitespace pass through.
+/// Dots are NOT separators here (unlike [`tool_chip_content`]'s genus
+/// lookup): they ride filenames — "read_file.py" must not humanize to "Py".
+pub fn humanize_tool_name(name: &str) -> String {
+    let name = name.trim();
+    if name.chars().any(char::is_whitespace) {
+        return name.to_owned();
+    }
+    let leaf = name
+        .rsplit("__")
+        .next()
+        .unwrap_or(name)
+        .rsplit([':', '/'])
+        .next()
+        .unwrap_or(name);
+    if leaf.is_empty() {
+        return leaf.to_owned();
+    }
+    let chars: Vec<char> = leaf.chars().collect();
+    let mut out = String::with_capacity(leaf.len() + 4);
+    for (ix, ch) in chars.iter().copied().enumerate() {
+        if matches!(ch, '_' | '-') {
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+            continue;
+        }
+        let prev = ix.checked_sub(1).and_then(|p| chars.get(p));
+        let next = chars.get(ix + 1);
+        let starts_word = ch.is_ascii_uppercase()
+            && prev.is_some_and(|p| {
+                p.is_ascii_lowercase()
+                    || p.is_ascii_digit()
+                    || (p.is_ascii_uppercase() && next.is_some_and(|n| n.is_ascii_lowercase()))
+            });
+        if starts_word && !out.ends_with(' ') {
+            out.push(' ');
+        }
+        if out.is_empty() || out.ends_with(' ') {
+            out.extend(ch.to_uppercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// State-aware phrase for one chip — what the tool IS doing or just did:
+/// "Running cargo test" / "Ran cargo test" / "cargo test failed" (waku's
+/// `activity_display_title`). The collapsed group header shows this while its
+/// group is the streaming tail; settled groups fall back to the count summary.
+pub fn activity_title(call: &ToolCall, resolved: bool, failed: bool) -> String {
+    enum Phase {
+        Running,
+        Done,
+        Failed,
+    }
+    let phase = if failed {
+        Phase::Failed
+    } else if resolved {
+        Phase::Done
+    } else {
+        Phase::Running
+    };
+    // "{verb}ing {target}" / "{past} {target}" / "{target} failed"
+    let phrase = |running: &str, done: &str, failed: &str, target: &str| match phase {
+        Phase::Running => format!("{running} {}", single_line(target)),
+        Phase::Done => format!("{done} {}", single_line(target)),
+        Phase::Failed => format!("{} {}", single_line(target), failed),
+    };
+    match call {
+        ToolCall::Exec { command } => phrase("Running", "Ran", "failed", command),
+        ToolCall::ReadFile { path } => phrase("Reading", "Read", "read failed", file_leaf(path)),
+        ToolCall::WriteFile { path, .. } => {
+            phrase("Writing", "Wrote", "write failed", file_leaf(path))
+        }
+        ToolCall::EditFile { path, .. } => {
+            phrase("Editing", "Edited", "edit failed", file_leaf(path))
+        }
+        ToolCall::ApplyPatch { path } => phrase(
+            "Patching",
+            "Patched",
+            "patch failed",
+            path.as_deref().map(file_leaf).unwrap_or("workspace"),
+        ),
+        ToolCall::Search { pattern, .. } => {
+            phrase("Searching", "Searched", "search failed", pattern)
+        }
+        ToolCall::Glob { pattern } => phrase("Finding files matching", "Found files matching", "file search failed", pattern),
+        ToolCall::WebFetch { url, .. } => phrase("Fetching", "Fetched", "fetch failed", url),
+        ToolCall::WebSearch { query } => phrase(
+            "Searching the web for",
+            "Searched the web for",
+            "web search failed",
+            query,
+        ),
+        ToolCall::Todo { .. } => match phase {
+            Phase::Running => "Updating todos".into(),
+            Phase::Done => "Updated todos".into(),
+            Phase::Failed => "Todo update failed".into(),
+        },
+        ToolCall::Mcp { tool, .. } => {
+            let name = humanize_tool_name(tool);
+            match phase {
+                Phase::Running => format!("Calling {name}"),
+                Phase::Done => format!("Called {name}"),
+                Phase::Failed => format!("{name} call failed"),
+            }
+        }
+        ToolCall::Unknown { name, input } => {
+            // Subagent spawns decode as Unknown "Agent[: …]" — spawn chips
+            // never sit under a collapsible header, but stay named anyway.
+            let (name, is_agent) = match name.strip_prefix("Agent: ") {
+                Some(description) => (description, true),
+                None if name == "Agent" => ("Subagent", true),
+                None => (name.as_str(), false),
+            };
+            if is_agent {
+                return match phase {
+                    Phase::Running => format!("Running subagent — {}", single_line(name)),
+                    Phase::Done => format!("Ran subagent — {}", single_line(name)),
+                    Phase::Failed => format!("Subagent failed — {}", single_line(name)),
+                };
+            }
+            let name = humanize_tool_name(name);
+            let _ = input;
+            match phase {
+                Phase::Running => format!("Running {name}"),
+                Phase::Done => format!("Ran {name}"),
+                Phase::Failed => format!("{name} failed"),
+            }
+        }
+    }
+}
+
+/// A thought chip's header word: live thinking names itself ("Thinking…"),
+/// a settled thought whose duration the UI measured reports it ("Thought for
+/// 12s"), and a thought with no known duration (historical docs) keeps the
+/// static label. Durations round up like waku (`max(1)`), so a blink still
+/// doesn't read as zero.
+fn thought_title(live: bool, secs: Option<u64>) -> String {
+    if live {
+        "Thinking…".to_string()
+    } else {
+        match secs {
+            Some(secs) => format!("Thought for {}s", secs.max(1)),
+            None => "Thought process".to_string(),
+        }
+    }
+}
+
+/// The ToolGroup header line (waku `activity_header_title`): while this group
+/// is the streaming tail it names the LATEST chip's activity — "Thinking…",
+/// "Running npm test" — so the live work is readable without expanding; once
+/// settled it falls back to the count summary. `thought_secs` aligns 1:1 with
+/// `tools` (durations measured by [`Transcript::observe_thought_timings`]).
+pub fn group_header_title(tools: &[ToolItem], live_tail: bool, thought_secs: &[Option<u64>]) -> String {
+    let secs_of = |ix: usize| thought_secs.get(ix).copied().flatten();
+    if live_tail
+        && let Some((ix, last)) = tools.iter().enumerate().next_back()
+    {
+        if last.is_thought {
+            return thought_title(!last.resolved, secs_of(ix));
+        }
+        if !is_spawn_link(last) {
+            return activity_title(&last.call, last.resolved, last.is_error);
+        }
+    }
+    let mut summary = tool_group_summary(tools);
+    // A lone timed thought upgrades the static label to its duration —
+    // "Thought process" → "Thought for 12s"; composed summaries swap the
+    // leading word and keep the tail.
+    let single_secs = {
+        let mut thoughts = tools.iter().enumerate().filter(|(_, t)| t.is_thought);
+        match (thoughts.next(), thoughts.next()) {
+            (Some((ix, t)), None) if t.resolved => secs_of(ix),
+            _ => None,
+        }
+    };
+    if let Some(secs) = single_secs {
+        if summary == "Thought process" {
+            summary = thought_title(false, Some(secs));
+        } else if let Some(rest) = summary.strip_prefix("Thought · ") {
+            summary = format!("{} · {rest}", thought_title(false, Some(secs)));
+        }
+    }
+    summary
+}
+
 // `single_line` and the per-kind chip label/detail are shared with the terminal
 // viewport (`zeron_proto::view`): a tool must be named identically on every
 // surface, and the one-line collapse is needed for the same reason in both (a
@@ -1361,8 +1574,23 @@ pub fn detail_height(detail: &ToolDetail) -> f32 {
         }
         ToolDetail::Diff { file, .. } => crate::changes::body_height(file),
         ToolDetail::Stats { stats } => stats.len() as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD,
+        ToolDetail::Thought { lines } => {
+            let content = lines.len() as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD;
+            content.min(THOUGHT_MAX_H)
+        }
     };
     DETAIL_SEPARATOR + body
+}
+
+/// One wheel step over a thought scrollbox: new top-origin offset plus
+/// whether the view sits pinned at the tail. Positive deltas scroll toward
+/// the START (gpui convention — composer `input_scroll_offset`). A box
+/// shorter than [`THOUGHT_MAX_H`] has max scroll 0, so it always reports
+/// "at tail" and never engages follow math.
+fn thought_scroll_step(current: f32, delta_y: f32, content_h: f32) -> (f32, bool) {
+    let max_scroll = (content_h - THOUGHT_MAX_H).max(0.0);
+    let next = (current - delta_y).clamp(0.0, max_scroll);
+    (next, next >= max_scroll - 1.0)
 }
 
 /// Height of the "Show full output/diff" affordance row appended below an
@@ -1620,6 +1848,81 @@ struct CachedRows {
     fingerprint: u64,
     rows: Vec<Row>,
 }
+
+/// UI-local wall-clock timing for one thought chip: when its streaming was
+/// first observed and how long it ran. The session doc carries no reasoning
+/// timestamps (schema parity with the TS edge), so durations are measured
+/// here — a thought seen only after the fact (historical docs) stays at the
+/// static "Thought process" label.
+#[derive(Default, Clone, Copy)]
+struct ThoughtTiming {
+    started: Option<Instant>,
+    settled_secs: Option<u64>,
+}
+
+/// Identity of one chip slot inside a projected tool-group row — the key for
+/// all per-chip UI state (detail folds, thought timings, scrollboxes, rail
+/// grabs). Replaces the earlier `"{row_id}#d{ix}"` string key so retention
+/// matches rows exactly instead of parsing key suffixes.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ChipSlot {
+    row: SharedString,
+    index: usize,
+}
+
+impl ChipSlot {
+    fn new(row: &str, index: usize) -> Self {
+        Self {
+            row: SharedString::from(row),
+            index,
+        }
+    }
+
+    /// Stable element-id/debug form of the slot.
+    fn as_key(&self) -> SharedString {
+        SharedString::from(format!("{}#d{}", self.row, self.index))
+    }
+}
+
+/// Scroll position of one thought's scrollbox body, keyed by [`ChipSlot`].
+/// Offsets are driven manually (composer-style) rather than through a gpui
+/// handle, so tail-follow and wheel release are pure, testable math.
+#[derive(Default, Clone, Copy)]
+struct ThoughtScroll {
+    scroll_top: f32,
+    /// Pin to the growing tail while the thought streams; released by
+    /// scrolling up, re-engaged by returning to the end (waku's
+    /// `follow_tail`).
+    follow_tail: bool,
+    /// The scrollbox body is under the pointer (rail visibility gate, like
+    /// the picker's `model_list_hovered`).
+    body_hovered: bool,
+    /// The rail/thumb itself is under the pointer.
+    bar_hovered: bool,
+    // -- measured each render of [`Transcript::thought_body`] so drag
+    // handlers can redo the rail math without re-wrapping any text --
+    content_h: f32,
+    viewport_h: f32,
+}
+
+/// Marker for GPUI's captured drag stream on a thought scrollbar thumb —
+/// the same treatment as the model picker's rail. Grab geometry lives in
+/// [`Transcript::thought_bar_grab`] so a track click can center the thumb.
+struct ThoughtBarDrag;
+
+/// Invisible drag preview: thumb drags manipulate the existing thumb.
+struct ThoughtBarDragGhost;
+
+impl gpui::Render for ThoughtBarDragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        gpui::Empty
+    }
+}
+
+// Thumb geometry/pointer math come from the shared floating-scrollbar widget
+// ([`crate::scrollbar`]); the thought rail only supplies its manual scroll
+// state in place of the picker's `ScrollHandle`.
+use crate::scrollbar::ThumbMetrics as ThoughtBarMetrics;
 
 #[derive(Default, Clone, Copy)]
 struct FoldState {
@@ -1923,11 +2226,23 @@ pub struct Transcript {
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
     folds: HashMap<SharedString, FoldState>,
-    /// Detail folds (output/diff) per chip, keyed `"{row_id}#d{ix}"` — full
+    /// Detail folds (output/diff) per chip, keyed by [`ChipSlot`] — full
     /// [`FoldState`]s so detail bodies tween open/closed exactly like the
     /// group fold. Render-local like `folds` — never part of the row
     /// fingerprint.
-    tool_details: HashMap<SharedString, FoldState>,
+    tool_details: HashMap<ChipSlot, FoldState>,
+    /// Thought-chip wall-clock timings, same [`ChipSlot`] keys as
+    /// [`Self::tool_details`] — feeds "Thought for 12s" (and the live
+    /// header's "Thinking…"). UI-local; see [`ThoughtTiming`].
+    thought_timings: HashMap<ChipSlot, ThoughtTiming>,
+    /// Thought scrollbox positions, same keys — see [`ThoughtScroll`].
+    thought_scrolls: HashMap<ChipSlot, ThoughtScroll>,
+    /// Active thumb drag on a thought scrollbar: the chip key plus where in
+    /// the thumb the grab started (picker `ModelScrollbarGrab`).
+    thought_bar_grab: Option<(ChipSlot, f32)>,
+    /// Window-space top of each rendered scrollbar rail, captured at paint
+    /// by a canvas child — pointer math for track clicks and drags.
+    thought_rail_tops: HashMap<ChipSlot, f32>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -2134,6 +2449,10 @@ impl Transcript {
             live_parsers: HashMap::new(),
             tree_cache: HashMap::new(),
             folds: HashMap::new(),
+            thought_timings: HashMap::new(),
+            thought_scrolls: HashMap::new(),
+            thought_bar_grab: None,
+            thought_rail_tops: HashMap::new(),
             tool_details: HashMap::new(),
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
@@ -3116,6 +3435,10 @@ impl Transcript {
             self.live_parsers.clear();
             self.tree_cache.clear();
             self.folds.clear();
+            self.thought_timings.clear();
+            self.thought_scrolls.clear();
+            self.thought_bar_grab = None;
+            self.thought_rail_tops.clear();
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
@@ -3170,6 +3493,7 @@ impl Transcript {
         for echo in &echoes {
             new_rows.extend(self.rows_for(echo, true));
         }
+        self.observe_thought_timings(&new_rows);
 
         // Text already streamed before this (re)attach is the veil BASELINE:
         // its rows' veils seed instead of fading (render creates them from
@@ -3309,6 +3633,421 @@ impl Transcript {
     }
 
     /// Cached row build for one entry (streaming entries bypass the cache).
+    /// Record thought-chip liveness from the freshly projected rows: an
+    /// unresolved chip stamps its first-seen instant; a chip that resolves
+    /// with a start on record freezes its duration. Chips already settled at
+    /// first sight (historical docs, chat re-open) get no duration — the
+    /// static label stays honest instead of guessing.
+    fn observe_thought_timings(&mut self, rows: &[Row]) {
+        let now = Instant::now();
+        for row in rows {
+            let RowKind::ToolGroup { tools, .. } = &row.kind else {
+                continue;
+            };
+            for (ix, tool) in tools.iter().enumerate() {
+                if !tool.is_thought {
+                    continue;
+                }
+                let key = ChipSlot::new(&row.id, ix);
+                let timing = self.thought_timings.entry(key).or_default();
+                if !tool.resolved {
+                    timing.started.get_or_insert(now);
+                } else if timing.settled_secs.is_none()
+                    && let Some(started) = timing.started
+                {
+                    timing.settled_secs = Some(now.duration_since(started).as_secs().max(1));
+                }
+            }
+        }
+        // Drop timings whose chips no longer project (row ids are stable per
+        // entry, so surviving chips keep their history across splices).
+        // Scroll positions share the same key shape and lifecycle.
+        self.thought_timings.retain(|key, _| {
+            rows.iter().any(|r| {
+                matches!(r.kind, RowKind::ToolGroup { .. }) && r.id == key.row
+            })
+        });
+        self.thought_scrolls.retain(|key, _| {
+            rows.iter().any(|r| {
+                matches!(r.kind, RowKind::ToolGroup { .. }) && r.id == key.row
+            })
+        });
+        self.thought_rail_tops
+            .retain(|key, _| self.thought_scrolls.contains_key(key));
+        // A chip that unmounts mid-drag (row virtualized out, chat switch)
+        // must not leave a dangling thumb grab.
+        if let Some((grab_key, _)) = &self.thought_bar_grab
+            && !self.thought_scrolls.contains_key(grab_key)
+        {
+            self.thought_bar_grab = None;
+        }
+    }
+
+    /// A thought chip's expandable body: the FULL wrapped text inside a
+    /// max-height scrollbox (waku's reasoning peek) — nothing is cut,
+    /// overflow scrolls. While the thought streams and the reader hasn't
+    /// scrolled away, the box pins to its tail; wheel-up releases it and
+    /// returning to the end re-engages. Lines render WINDOWED around the
+    /// offset so a long think costs O(viewport), not O(text), per frame.
+    fn thought_body(
+        &mut self,
+        key: &ChipSlot,
+        lines: &[SharedString],
+        live: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let content_h = lines.len() as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD;
+        let viewport_h = content_h.min(THOUGHT_MAX_H);
+        let max_scroll = (content_h - viewport_h).max(0.0);
+        let state = self.thought_scrolls.entry(key.clone()).or_default();
+        if !live {
+            state.follow_tail = false;
+        } else if state.follow_tail {
+            // Follow the growing tail while the reader hasn't scrolled away.
+            state.scroll_top = max_scroll;
+        }
+        state.scroll_top = state.scroll_top.clamp(0.0, max_scroll);
+        // Measured geometry rides on the scroll state so the drag handlers
+        // can redo the rail math without re-wrapping any text.
+        state.content_h = content_h;
+        state.viewport_h = viewport_h;
+        let scroll_top = state.scroll_top;
+        let show_top = scroll_top > 0.5;
+        let show_bottom = scroll_top < max_scroll - 0.5;
+
+        const OVERDRAW_LINES: usize = 24;
+        let first = (((scroll_top - 6.0) / OUTPUT_LINE_HEIGHT).max(0.0) as usize)
+            .saturating_sub(OVERDRAW_LINES);
+        let last = ((((scroll_top - 6.0 + viewport_h) / OUTPUT_LINE_HEIGHT)
+            .ceil()
+            .max(0.0) as usize)
+            + OVERDRAW_LINES)
+            .min(lines.len());
+
+        // Virtualized slice: spacers hold the full content height while only
+        // the on-screen window of lines renders, and the relative offset
+        // slides that window to the scroll position (overflow_hidden crops
+        // it). Without the offset the visible pixels never move.
+        let mut column = div()
+            .w_full()
+            .flex_none()
+            .relative()
+            .top(px(-scroll_top))
+            .flex()
+            .flex_col();
+        if first > 0 {
+            column = column.child(
+                div()
+                    .h(px(first as f32 * OUTPUT_LINE_HEIGHT))
+                    .w_full()
+                    .flex_none(),
+            );
+        }
+        column = column.children(
+            lines[first..last]
+                .iter()
+                .map(|line| output_line_row(line, theme)),
+        );
+        if last < lines.len() {
+            column = column.child(
+                div()
+                    .h(px((lines.len() - last) as f32 * OUTPUT_LINE_HEIGHT))
+                    .w_full()
+                    .flex_none(),
+            );
+        }
+
+        let body = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .pt(px(6.0))
+            .pb(px(6.0))
+            .font_family(theme.font_mono.clone())
+            .text_size(px(11.5))
+            .child(column);
+
+        // The model picker's floating rail (`pickers.rs
+        // render_model_scrollbar`) keyed per chip: visible while the box or
+        // the rail itself is hovered (or mid-drag), driven through the
+        // handlers below.
+        let bar_key = key.clone();
+        let dragging = self
+            .thought_bar_grab
+            .as_ref()
+            .is_some_and(|(grabbed, _)| *grabbed == bar_key);
+        let show_bar = self
+            .thought_scrolls
+            .get(key)
+            .is_some_and(|s| s.body_hovered || s.bar_hovered)
+            || dragging;
+        let metrics = self.thought_scrolls.get(key).and_then(|s| {
+            crate::scrollbar::metrics_for(s.scroll_top, s.content_h, s.viewport_h)
+        });
+
+        let hover_key = bar_key.clone();
+        let mut container = div()
+            .id(SharedString::from(format!("{}-body", key.as_key())))
+            .h(px(viewport_h))
+            .w_full()
+            .overflow_hidden()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.on_thought_body_hover(&hover_key, hovered, cx);
+            }))
+            // GPUI dispatches this captured stream while a thumb drag runs,
+            // including when the pointer leaves the box (picker parity).
+            .on_drag_move(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<ThoughtBarDrag>, _, cx| {
+                    this.on_thought_bar_drag_move(event, cx);
+                },
+            ))
+            // Paint-phase capture of this box's window-space bounds, plus a
+            // CAPTURE-phase wheel interceptor. The enclosing gpui `list`
+            // registers its raw wheel listener AFTER painting its rows, so
+            // reverse-order bubble dispatch scrolls the transcript before a
+            // bubble listener here could ever run (both scrolled at once).
+            // Capture dispatch runs front-to-back, and this canvas paints
+            // with the row content — strictly before the list registers —
+            // so stopping the event here wins.
+            .child({
+                let weak = cx.weak_entity();
+                let rail_key = bar_key.clone();
+                let state_key = bar_key.clone();
+                let wheel_weak = weak.clone();
+                gpui::canvas(
+                    move |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        window.on_mouse_event(
+                            move |event: &gpui::ScrollWheelEvent, phase, _window, cx| {
+                                if phase != gpui::DispatchPhase::Capture
+                                    || !bounds.contains(&event.position)
+                                {
+                                    return;
+                                }
+                                let _ = wheel_weak.update(cx, |this, cx| {
+                                    let delta_y = f32::from(
+                                        event.delta.pixel_delta(px(OUTPUT_LINE_HEIGHT)).y,
+                                    );
+                                    let Some(state) =
+                                        this.thought_scrolls.get_mut(&state_key)
+                                    else {
+                                        return;
+                                    };
+                                    let (next, at_tail) =
+                                        thought_scroll_step(state.scroll_top, delta_y, content_h);
+                                    let moved = next != state.scroll_top;
+                                    if moved {
+                                        state.scroll_top = next;
+                                        // Scrolling up releases tail-follow; landing
+                                        // back at the end re-engages it.
+                                        state.follow_tail = at_tail;
+                                        cx.notify();
+                                    }
+                                    if moved || (delta_y != 0.0 && max_scroll > 0.0) {
+                                        // Consumed, or pinned at a boundary of an
+                                        // actually-scrollable box: contain the wheel so
+                                        // it never chains into the transcript list
+                                        // behind the chip (the composer's rule). Short
+                                        // thoughts pass through untouched.
+                                        cx.stop_propagation();
+                                    }
+                                });
+                            },
+                        );
+                        let _ = weak.update(cx, |this, _| {
+                            this.thought_rail_tops
+                                .insert(rail_key.clone(), f32::from(bounds.top()));
+                        });
+                    },
+                )
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+            })
+            .child(crate::edge_fade::edge_faded(
+                12.0,
+                show_top,
+                show_bottom,
+                body,
+            ));
+        if show_bar && let Some(metrics) = metrics {
+            container = container.child(self.render_thought_scrollbar(
+                &bar_key, metrics, dragging, theme, cx,
+            ));
+        }
+        container.into_any_element()
+    }
+
+    /// The thought scrollbox's floating scrollbar — the model picker's
+    /// `render_model_scrollbar` verbatim (inset track, 3px thumb widening to
+    /// 5px under the pointer, 10px hit strip), keyed per chip.
+    fn render_thought_scrollbar(
+        &mut self,
+        key: &ChipSlot,
+        m: ThoughtBarMetrics,
+        dragging: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl gpui::IntoElement {
+        let active = self
+            .thought_scrolls
+            .get(key)
+            .is_some_and(|s| s.bar_hovered)
+            || dragging;
+        let hover_key = key.clone();
+        let down_key = key.clone();
+        div()
+            .id(SharedString::from(format!("{}-bar", key.as_key())))
+            .absolute()
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .right(px(0.0))
+            .w(px(crate::scrollbar::HIT_WIDTH))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.on_thought_bar_hover(&hover_key, hovered, cx);
+            }))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.on_thought_bar_mouse_down(&down_key, event, cx);
+                }),
+            )
+            .on_drag(ThoughtBarDrag, |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| ThoughtBarDragGhost)
+            })
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                    this.on_thought_bar_mouse_up(cx);
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                    this.on_thought_bar_mouse_up(cx);
+                }),
+            )
+            .child(crate::scrollbar::thumb(&m, active, theme))
+    }
+
+    fn on_thought_body_hover(&mut self, key: &ChipSlot, hovered: &bool, cx: &mut Context<Self>) {
+        let Some(state) = self.thought_scrolls.get_mut(key) else {
+            return;
+        };
+        if state.body_hovered == *hovered {
+            return;
+        }
+        state.body_hovered = *hovered;
+        cx.notify();
+    }
+
+    fn on_thought_bar_hover(&mut self, key: &ChipSlot, hovered: &bool, cx: &mut Context<Self>) {
+        // Keep the active treatment while a captured drag travels outside
+        // the box; the hover callback quite correctly turns false there.
+        let dragged = self
+            .thought_bar_grab
+            .as_ref()
+            .is_some_and(|(grabbed, _)| grabbed == key);
+        let active = *hovered || dragged;
+        let Some(state) = self.thought_scrolls.get_mut(key) else {
+            return;
+        };
+        if state.bar_hovered != active {
+            state.bar_hovered = active;
+            cx.notify();
+        }
+    }
+
+    /// Track press: grab where the pointer sits relative to the thumb (a bare
+    /// track click centers the thumb under it first), then jump. Mirrors
+    /// `pickers.rs on_model_scrollbar_mouse_down`.
+    fn on_thought_bar_mouse_down(
+        &mut self,
+        key: &ChipSlot,
+        event: &gpui::MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.thought_scrolls.get(key).copied() else {
+            return;
+        };
+        let Some(metrics) =
+            crate::scrollbar::metrics_for(state.scroll_top, state.content_h, state.viewport_h)
+        else {
+            return;
+        };
+        let Some(&rail_top) = self.thought_rail_tops.get(key) else {
+            return;
+        };
+        let pointer_in_track =
+            f32::from(event.position.y) - rail_top - crate::scrollbar::TRACK_INSET;
+        let grab_offset = crate::scrollbar::grab_offset_for(pointer_in_track, &metrics);
+        self.thought_bar_grab = Some((key.clone(), grab_offset));
+        self.thought_scrollbar_to_pointer(key, event.position.y, grab_offset, cx);
+        cx.stop_propagation();
+    }
+
+    /// Pointer → scroll offset through the shared rail math (the picker's
+    /// `model_scrollbar_to_pointer`), keyed per chip.
+    fn thought_scrollbar_to_pointer(
+        &mut self,
+        key: &ChipSlot,
+        pointer_y: gpui::Pixels,
+        grab_offset: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.thought_scrolls.get(key).copied() else {
+            return;
+        };
+        let Some(metrics) =
+            crate::scrollbar::metrics_for(state.scroll_top, state.content_h, state.viewport_h)
+        else {
+            return;
+        };
+        let Some(&rail_top) = self.thought_rail_tops.get(key) else {
+            return;
+        };
+        let pointer_in_track = f32::from(pointer_y) - rail_top - crate::scrollbar::TRACK_INSET;
+        let next = crate::scrollbar::scroll_for_pointer(pointer_in_track, grab_offset, metrics);
+        let Some(state) = self.thought_scrolls.get_mut(key) else {
+            return;
+        };
+        state.scroll_top = next;
+        // Same release/re-engage contract as the wheel: riding the thumb to
+        // the end follows the stream again.
+        state.follow_tail = next >= metrics.max_scroll - 1.0;
+        cx.notify();
+    }
+
+    fn on_thought_bar_drag_move(
+        &mut self,
+        event: &gpui::DragMoveEvent<ThoughtBarDrag>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((key, grab_offset)) = self.thought_bar_grab.clone() else {
+            return;
+        };
+        self.thought_scrollbar_to_pointer(&key, event.event.position.y, grab_offset, cx);
+    }
+
+    fn on_thought_bar_mouse_up(&mut self, cx: &mut Context<Self>) {
+        let grabbed = self.thought_bar_grab.take().map(|(key, _)| key);
+        // If the pointer left mid-drag its final hover(false) was swallowed
+        // by the drag guard — drop the latch unless it really still hovers.
+        if let Some(key) = grabbed
+            && let Some(state) = self.thought_scrolls.get_mut(&key)
+            && !state.body_hovered
+        {
+            state.bar_hovered = false;
+        }
+        cx.notify();
+    }
+
     fn rows_for(&mut self, entry: &SessionMessageEntry, pending: bool) -> Vec<Row> {
         let streaming = entry.status == Some(MessageStatus::Streaming);
         let fingerprint = entry_fingerprint(entry, pending);
@@ -4411,7 +5150,7 @@ impl Transcript {
                     return FoldState::default();
                 }
                 self.tool_details
-                    .get(&SharedString::from(format!("{row_id}#d{ix}")))
+                    .get(&ChipSlot::new(row_id, ix))
                     .copied()
                     .unwrap_or_default()
             })
@@ -4457,7 +5196,20 @@ impl Transcript {
                 })
                 .sum::<f32>();
         let target = if open { open_height } else { 0.0 };
-        let summary = tool_group_summary(tools);
+        // Per-chip thought durations (aligned with `tools`) for the header's
+        // "Thinking…" / "Thought for 12s" phrasing.
+        let thought_secs: Vec<Option<u64>> = tools
+            .iter()
+            .enumerate()
+            .map(|(ix, tool)| {
+                tool.is_thought.then_some(ix).and_then(|ix| {
+                    self.thought_timings
+                        .get(&ChipSlot::new(row_id, ix))
+                        .and_then(|timing| timing.settled_secs)
+                })
+            })
+            .collect();
+        let summary = group_header_title(tools, auto_open, &thought_secs);
 
         let toggle_id = row_id.clone();
         // Header (zeron tool-group.tsx): a small chevron tile centered over the
@@ -4543,7 +5295,20 @@ impl Transcript {
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
                 if detail.is_none() && invocation.is_none() {
-                    return tool_chip(tool, collapses, theme, cx.entity_id(), cx);
+                    // Status affordance for chips with nothing to expand
+                    // (waku tool-chip.tsx): failed shows the danger cross,
+                    // still-running pulses quietly. Expandable chips keep
+                    // their chevron — the header line carries liveness.
+                    let trail = if tool.is_error {
+                        Some(ChipTrail::Failed)
+                    } else if !tool.resolved {
+                        Some(ChipTrail::Running {
+                            id: SharedString::from(format!("{row_id}#p{ix}")),
+                        })
+                    } else {
+                        None
+                    };
+                    return tool_chip(tool, collapses, trail, theme, cx.entity_id(), cx);
                 }
                 let affordance = affordances[ix].clone();
                 let affordance_h = if affordance.is_some() {
@@ -4553,7 +5318,7 @@ impl Transcript {
                 };
                 let open = detail_opens[ix];
                 let dfold = detail_folds[ix];
-                let key = SharedString::from(format!("{row_id}#d{ix}"));
+                let key = ChipSlot::new(row_id, ix);
                 // Expandable chip: ONE card whose header row is the chip and
                 // whose body is the detail — not a floating card below it.
                 // The guide rail stretches with the row, so an open detail
@@ -4591,7 +5356,7 @@ impl Transcript {
                     .bg(crate::theme::ink(0.03))
                     .child(
                         div()
-                            .id(key.clone())
+                            .id(key.as_key())
                             .h(px(CHIP_HEADER_HEIGHT))
                             .flex_none()
                             .flex()
@@ -4624,7 +5389,7 @@ impl Transcript {
                                 group.toggled_at = Some(Instant::now());
                                 cx.notify();
                             }))
-                            .child(chip_header(tool, open, theme, cx.entity_id(), cx)),
+                            .child(chip_header(tool, open, thought_secs[ix], theme, cx.entity_id(), cx)),
                     );
                 // The body stays mounted while the close tween shrinks over it.
                 // Invocation first (what was asked), then output/diff (what
@@ -4641,14 +5406,22 @@ impl Transcript {
                             .child(detail_body(invocation, None, theme));
                     }
                     if let Some(detail) = detail.as_deref() {
-                        card = card
-                            .child(
-                                div()
-                                    .h(px(DETAIL_SEPARATOR))
-                                    .flex_none()
-                                    .bg(crate::theme::hairline(0.06)),
-                            )
-                            .child(detail_body(detail, detail_highlights[ix].clone(), theme));
+                        card = card.child(
+                            div()
+                                .h(px(DETAIL_SEPARATOR))
+                                .flex_none()
+                                .bg(crate::theme::hairline(0.06)),
+                        );
+                        // A thought renders as a bounded SCROLLBOX holding
+                        // its full text (never truncated); everything else
+                        // stays the ordinary capped detail block.
+                        if let ToolDetail::Thought { lines } = detail {
+                            card = card
+                                .child(self.thought_body(&key, lines, !tool.resolved, theme, cx));
+                        } else {
+                            card =
+                                card.child(detail_body(detail, detail_highlights[ix].clone(), theme));
+                        }
                     }
                     if let Some(ChipAffordance { blob_ref, label }) = affordance {
                         let loading = matches!(
@@ -4656,7 +5429,7 @@ impl Transcript {
                             Some(BlobFetch::Loading(_))
                         );
                         let mut row = div()
-                            .id(SharedString::from(format!("{key}-blob")))
+                            .id(SharedString::from(format!("{}-blob", key.as_key())))
                             .h(px(BLOB_AFFORDANCE_HEIGHT))
                             .flex_none()
                             .px(px(12.0))
@@ -4680,7 +5453,7 @@ impl Transcript {
                 let card: AnyElement = if animating {
                     let from = dfold.from;
                     card.with_animation(
-                        SharedString::from(format!("{key}-tween{}", dfold.epoch)),
+                        SharedString::from(format!("{}-tween{}", key.as_key(), dfold.epoch)),
                         RESIZE.animation(),
                         move |el, t| el.h(px(motion::lerp(from, card_target, t))),
                     )
@@ -4981,6 +5754,21 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
     }
 }
 
+/// One mono line of an output/thought body: fixed height (analytic layout
+/// math depends on it), horizontal padding, single truncated line.
+fn output_line_row(line: &SharedString, theme: &Theme) -> gpui::Div {
+    div()
+        .h(px(OUTPUT_LINE_HEIGHT))
+        .w_full()
+        .min_w_0()
+        .px(px(12.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .text_color(theme.text.opacity(0.85))
+        .child(div().w_full().min_w_0().truncate().child(line.clone()))
+}
+
 /// The body of an expanded chip card, under the header's separator. Diffs
 /// render through the changes pane's section body — the real component, with
 /// hunk headers, dual line-number gutters, accent bars, row washes, and
@@ -5045,17 +5833,7 @@ fn detail_body(
             .py(px(6.0))
             .font_family(theme.font_mono.clone())
             .text_size(px(11.5))
-            .children(lines.iter().map(|line| {
-                div()
-                    .h(px(OUTPUT_LINE_HEIGHT))
-                    .w_full()
-                    .min_w_0()
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .text_color(theme.text.opacity(0.85))
-                    .child(div().w_full().min_w_0().truncate().child(line.clone()))
-            }))
+            .children(lines.iter().map(|line| output_line_row(line, theme)))
             .when(*truncated_by > 0, |block| {
                 block.child(
                     div()
@@ -5069,6 +5847,15 @@ fn detail_body(
                 )
             })
             .into_any_element(),
+        // Unreachable via the chip path (thoughts dispatch to
+        // [`Transcript::thought_body`] first); kept exhaustive by rendering
+        // the full text as a plain block.
+        ToolDetail::Thought { lines } => body
+            .py(px(6.0))
+            .font_family(theme.font_mono.clone())
+            .text_size(px(11.5))
+            .children(lines.iter().map(|line| output_line_row(line, theme)))
+            .into_any_element(),
     }
 }
 
@@ -5079,6 +5866,12 @@ enum ChipTrail {
     /// Top-right "opens elsewhere" arrow — the spawn chip's link to its
     /// subagent tab.
     OpenArrow,
+    /// Quiet pulsing accent dot for a still-running chip with nothing to
+    /// expand (waku tool-chip.tsx). `id` keys the animation.
+    Running { id: SharedString },
+    /// Danger cross for a failed chip with nothing to expand — failures on
+    /// detail-less tools would otherwise be tint-only and easy to miss.
+    Failed,
 }
 
 /// The chip's content row: icon tile + label + detail line (+ trailing tile
@@ -5093,14 +5886,16 @@ enum ChipTrail {
 fn chip_header_row(
     tool: &ToolItem,
     trail: Option<ChipTrail>,
+    thought_secs: Option<u64>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
 ) -> gpui::Div {
     let (label, detail) = if tool.is_thought {
-        ("Thought process", String::new())
+        (thought_title(!tool.resolved, thought_secs), String::new())
     } else {
-        tool_chip_content(&tool.call)
+        let (label, detail) = tool_chip_content(&tool.call);
+        (label.to_owned(), detail)
     };
     let running = tool.subagent_ref.is_some()
         && matches!(tool.subagent_status, Some(SubagentStatus::Running));
@@ -5212,7 +6007,9 @@ fn chip_header_row(
         })
         .when_some(trail, |row, trail| {
             // Trailing tile matching the group header's: a chevron for the
-            // output/diff accordion, or the open-arrow for spawn chips.
+            // output/diff accordion, or the open-arrow for spawn chips. The
+            // status trails (pulse / cross) sit bare — a tile around them
+            // read as one more button.
             let tile = div()
                 .size(px(18.0))
                 .flex_none()
@@ -5231,6 +6028,37 @@ fn chip_header_row(
                         .size(px(11.0))
                         .text_color(theme.text_muted.opacity(0.8)),
                 ),
+                ChipTrail::Running { id } => {
+                    // Fixed 18px bare slot so the pulse never shifts layout;
+                    // no tile chrome — tiles read as buttons.
+                    let dot = div()
+                        .size(px(6.0))
+                        .rounded_full()
+                        .bg(theme.accent)
+                        .opacity(0.9);
+                    let dot = if motion::reduced_motion(cx) {
+                        dot.into_any_element()
+                    } else {
+                        dot.with_animation(
+                            id,
+                            gpui::Animation::new(std::time::Duration::from_millis(1400)).repeat(),
+                            |el, t| el.opacity(0.25 + 0.75 * (1.0 - 2.0 * (t - 0.5).abs())),
+                        )
+                        .into_any_element()
+                    };
+                    div()
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(dot)
+                }
+                ChipTrail::Failed => tile.child(
+                    crate::icons::icon(crate::icons::CLOSE)
+                        .size(px(10.0))
+                        .text_color(theme.danger),
+                ),
             })
         })
 }
@@ -5239,11 +6067,19 @@ fn chip_header_row(
 fn chip_header(
     tool: &ToolItem,
     open: bool,
+    thought_secs: Option<u64>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
 ) -> gpui::Div {
-    chip_header_row(tool, Some(ChipTrail::Chevron { open }), theme, view, cx)
+    chip_header_row(
+        tool,
+        Some(ChipTrail::Chevron { open }),
+        thought_secs,
+        theme,
+        view,
+        cx,
+    )
 }
 
 /// Max chars a subagent tab title keeps. The strip chip is fixed-width and
@@ -5312,6 +6148,7 @@ fn subagent_tab_title(call: &ToolCall) -> SharedString {
 fn tool_chip(
     tool: &ToolItem,
     rail: bool,
+    trail: Option<ChipTrail>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -5346,7 +6183,7 @@ fn tool_chip(
                 .border_1()
                 .border_color(crate::theme::hairline(0.07))
                 .bg(crate::theme::ink(0.03))
-                .child(chip_header_row(tool, None, theme, view, cx)),
+                .child(chip_header_row(tool, trail, None, theme, view, cx)),
         )
         .into_any_element()
 }
@@ -5402,6 +6239,7 @@ fn subagent_chip(
                 .child(chip_header_row(
                     tool,
                     Some(ChipTrail::OpenArrow),
+                    None,
                     theme,
                     view,
                     cx,
@@ -6144,11 +6982,11 @@ mod tests {
         assert_eq!(tools.len(), 4);
         assert!(tools[0].is_thought && tools[2].is_thought);
         assert!(!tools[1].is_thought && !tools[3].is_thought);
-        // Thought chips carry their text as an output-style detail with an
-        // ANALYTIC height, so the group's fold tween covers them.
+        // Thought chips carry their FULL text as a scrollbox detail (never
+        // truncated) whose clamped height stays analytic for the fold tween.
         assert!(matches!(
             tools[0].detail.as_deref(),
-            Some(ToolDetail::Output { lines, .. }) if !lines.is_empty()
+            Some(ToolDetail::Thought { lines }) if !lines.is_empty()
         ));
         let summary = tool_group_summary(&tools);
         assert!(summary.starts_with("Thought 2 times"), "{summary}");
@@ -7164,5 +8002,240 @@ mod tests {
             vec![text_part("t0", ""), text_part("t1", "   ")],
         );
         assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
+    }
+
+    fn item(call: ToolCall, resolved: bool) -> ToolItem {
+        ToolItem {
+            call,
+            is_error: false,
+            resolved,
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+            is_thought: false,
+        }
+    }
+
+    fn thought(resolved: bool) -> ToolItem {
+        ToolItem {
+            is_thought: true,
+            ..item(
+                ToolCall::Unknown {
+                    name: "Thought process".into(),
+                    input: None,
+                },
+                resolved,
+            )
+        }
+    }
+
+    #[test]
+    fn activity_titles_carry_state() {
+        // Running / done / failed across the common kinds (waku
+        // `activity_display_title`): progressive while unresolved, past once
+        // settled, explicit failure last.
+        let exec = |c: &str| ToolCall::Exec {
+            command: c.into(),
+        };
+        assert_eq!(activity_title(&exec("cargo test"), false, false), "Running cargo test");
+        assert_eq!(activity_title(&exec("cargo test"), true, false), "Ran cargo test");
+        assert_eq!(activity_title(&exec("cargo test"), true, true), "cargo test failed");
+
+        let edit = ToolCall::EditFile {
+            path: "crates/ui/src/deep/main.rs".into(),
+            old_string: None,
+            new_string: None,
+        };
+        // Files name their LEAF, not the repo-relative path.
+        assert_eq!(activity_title(&edit, false, false), "Editing main.rs");
+        assert_eq!(activity_title(&edit, true, false), "Edited main.rs");
+        assert_eq!(activity_title(&edit, true, true), "main.rs edit failed");
+
+        let search = ToolCall::WebSearch {
+            query: "gpui list".into(),
+        };
+        assert_eq!(
+            activity_title(&search, false, false),
+            "Searching the web for gpui list"
+        );
+        assert_eq!(
+            activity_title(&search, true, true),
+            "gpui list web search failed"
+        );
+
+        // MCP tools humanize their leaf name.
+        let mcp = ToolCall::Mcp {
+            server: "github".into(),
+            tool: "list_pull_requests".into(),
+            input: None,
+        };
+        assert_eq!(activity_title(&mcp, false, false), "Calling List Pull Requests");
+        assert_eq!(activity_title(&mcp, true, false), "Called List Pull Requests");
+
+        // Subagent spawns keep their task visible.
+        let agent = ToolCall::Unknown {
+            name: "Agent: verify the marker pipeline".into(),
+            input: None,
+        };
+        assert_eq!(
+            activity_title(&agent, false, false),
+            "Running subagent — verify the marker pipeline"
+        );
+    }
+
+    #[test]
+    fn humanize_tool_name_splits_snake_and_camel() {
+        assert_eq!(humanize_tool_name("web_search"), "Web Search");
+        assert_eq!(humanize_tool_name("TodoWrite"), "Todo Write");
+        assert_eq!(
+            humanize_tool_name("mcp__github__list_prs"),
+            "List Prs"
+        );
+        assert_eq!(humanize_tool_name("read_file.py"), "Read File.py");
+        // Already-human names pass through untouched.
+        assert_eq!(humanize_tool_name("Deploy Site"), "Deploy Site");
+        assert_eq!(humanize_tool_name("run"), "Run");
+    }
+
+    #[test]
+    fn thought_titles_read_live_timed_or_static() {
+        assert_eq!(thought_title(true, None), "Thinking…");
+        assert_eq!(thought_title(false, Some(12)), "Thought for 12s");
+        // A blink still doesn't read as zero.
+        assert_eq!(thought_title(false, Some(0)), "Thought for 1s");
+        // No measurement (historical docs): static fallback.
+        assert_eq!(thought_title(false, None), "Thought process");
+    }
+
+    #[test]
+    fn thought_detail_keeps_every_line_in_a_scrollbox() {
+        let long = (0..60)
+            .map(|i| format!("reasoning step {i} with some prose to wrap around"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let item = thought_item(&long, false);
+        let Some(ToolDetail::Thought { lines }) = item.detail.as_deref() else {
+            panic!("expected a thought detail");
+        };
+        // Nothing is cut — well past the old 24-line cap.
+        assert!(lines.len() > OUTPUT_DETAIL_MAX_LINES);
+        assert!(lines.iter().all(|l| !l.is_empty()));
+
+        // The box clamps at THOUGHT_MAX_H so fold tweens stay analytic.
+        let tall = detail_height(item.detail.as_deref().unwrap());
+        assert_eq!(tall, DETAIL_SEPARATOR + THOUGHT_MAX_H);
+        // A short thought is exactly its content, unclamped.
+        let short = thought_item("quick thought", false);
+        let expected_lines = match short.detail.as_deref() {
+            Some(ToolDetail::Thought { lines }) => lines.len(),
+            _ => panic!("expected a thought detail"),
+        } as f32;
+        assert_eq!(
+            detail_height(short.detail.as_deref().unwrap()),
+            DETAIL_SEPARATOR + expected_lines * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD
+        );
+    }
+
+    #[test]
+    fn thought_fingerprint_tracks_content_not_just_shape() {
+        // A same-length rewrite (identical line count and byte total) must
+        // still re-splice the row so the scrollbox body follows the text.
+        let a = thought_item("abcdef ghijkl", false);
+        let b = thought_item("ghijkl abcdef", false);
+        assert_ne!(
+            tool_fingerprint(std::slice::from_ref(&a), false),
+            tool_fingerprint(std::slice::from_ref(&b), false)
+        );
+        // Growth keeps tripping it, as before.
+        let grown = thought_item("abcdef ghijkl and then more prose arrived", false);
+        assert_ne!(
+            tool_fingerprint(std::slice::from_ref(&a), false),
+            tool_fingerprint(std::slice::from_ref(&grown), false)
+        );
+    }
+
+    #[test]
+    fn thought_scroll_steps_release_and_reengage_the_tail() {
+        let content_h = 100.0 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD; // over the cap
+        let max = (content_h - THOUGHT_MAX_H).max(0.0);
+
+        // Following the tail: wheel-up (positive delta) releases immediately…
+        let (next, at_tail) = thought_scroll_step(max, 36.0, content_h);
+        assert_eq!(next, max - 36.0);
+        assert!(!at_tail);
+        // …and scrolling back to the end re-engages it.
+        let (next, at_tail) = thought_scroll_step(next, -36.0, content_h);
+        assert_eq!(next, max);
+        assert!(at_tail);
+        // Clamped at both ends.
+        let (top, _) = thought_scroll_step(0.0, f32::MAX, content_h);
+        assert_eq!(top, 0.0);
+        // A short box never scrolls and always reports the tail.
+        let (next, at_tail) = thought_scroll_step(0.0, -500.0, 10.0 * OUTPUT_LINE_HEIGHT);
+        assert_eq!(next, 0.0);
+        assert!(at_tail);
+    }
+
+    #[test]
+    fn group_header_names_the_live_activity_then_the_summary() {
+        // Live tail: the header names the LATEST chip's activity, not the
+        // count summary (waku activity_header_title).
+        let live = vec![
+            item(ToolCall::Exec {
+                command: "ls".into(),
+            }, true),
+            item(ToolCall::Exec {
+                command: "npm test".into(),
+            }, false),
+        ];
+        assert_eq!(
+            group_header_title(&live, true, &[None, None]),
+            "Running npm test"
+        );
+        // Same rows, settled: back to the summary.
+        assert_eq!(
+            group_header_title(&live, false, &[None, None]),
+            "Ran 2 commands"
+        );
+        // A live tail that ends in streaming thinking names THAT.
+        let thinking = vec![
+            item(ToolCall::Exec {
+                command: "ls".into(),
+            }, true),
+            thought(false),
+        ];
+        assert_eq!(
+            group_header_title(&thinking, true, &[None, None]),
+            "Thinking…"
+        );
+        // Settled single timed thought upgrades its label.
+        assert_eq!(
+            group_header_title(&[thought(true)], false, &[Some(7)]),
+            "Thought for 7s"
+        );
+        assert_eq!(
+            group_header_title(
+                &[thought(true), item(ToolCall::Glob { pattern: "*.rs".into() }, true)],
+                false,
+                &[Some(7), None],
+            ),
+            // The lone segment's initial rides the shared summary's
+            // capitalize-first rule, so it stays capitalized here.
+            "Thought for 7s · Searched 1 time",
+        );
+        // Untimed or multi-thought groups keep the static phrasing.
+        assert_eq!(
+            group_header_title(&[thought(true)], false, &[None]),
+            "Thought process"
+        );
+        assert_eq!(
+            group_header_title(&[thought(true), thought(true)], false, &[None, None]),
+            "Thought 2 times"
+        );
     }
 }
