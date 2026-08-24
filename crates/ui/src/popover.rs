@@ -428,6 +428,38 @@ pub fn anchored_menu_below(
     anchored_menu_below_gap(id, content, closing, 6.0)
 }
 
+/// [`anchored_menu_below`] right-aligned to the trigger's right edge. This is
+/// the dropdown counterpart to [`anchored_menu_above_end`]: trailing sidebar
+/// controls can open a full-width card leftward without leaving the sidebar.
+pub fn anchored_menu_below_end(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
+    div()
+        .absolute()
+        .bottom_0()
+        .right_0()
+        .size_0()
+        .child(
+            gpui::deferred(
+                gpui::anchored()
+                    .anchor(Anchor::TopRight)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(menu_motion(
+                        id.into(),
+                        exit,
+                        div().occlude().pt(px(6.0)).child(content),
+                    )),
+            )
+            .priority(1)
+            .into_any_element(),
+        )
+        .into_any_element()
+}
+
 /// [`anchored_menu_below`] with a caller-chosen trigger→card gap — the
 /// changes-header dropdowns hang off a tight titlebar band and need more
 /// breathing room than the default 6px (user report; t3code sits near 10).
@@ -755,6 +787,28 @@ pub fn menu_separator() -> gpui::Div {
 /// would ripple past this task's file scope).
 pub fn band() -> gpui::Hsla {
     crate::theme::band()
+}
+
+/// Shared shell for command-palette-style flows. The recessed header/footer
+/// bands are supplied by callers, while this owns the glass tint, outline,
+/// radius, clipping, and shadow that make Cmd+K and its sibling flows read as
+/// one component family.
+pub fn palette_card(theme: &Theme, width: Pixels, corner_radius: f32) -> gpui::Div {
+    div()
+        .w(width)
+        .rounded(px(corner_radius))
+        .border_1()
+        .border_color(hairline(0.10))
+        .bg(if theme.is_frost() {
+            theme.glass_overlay()
+        } else {
+            theme.surface_overlay
+        })
+        .shadow_lg()
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .text_color(theme.text)
 }
 
 /// One footer key-cap (22px, rounded-5, `white/[0.05]`) holding arbitrary
