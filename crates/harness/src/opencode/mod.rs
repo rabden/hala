@@ -569,6 +569,24 @@ impl Server {
         directory: Option<&str>,
         body: &Value,
     ) -> Result<Value, HarnessError> {
+        let (status, text) = self.post_json_raw(path, directory, body).await?;
+        if !status.is_success() {
+            return Err(HarnessError::Protocol(post_error_message(
+                path, status, &text,
+            )));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    /// POST returning `(status, raw body)`; only transport failures error.
+    /// HTTP status handling is the caller's (the lazy-migration retry in
+    /// [`create_session`] needs to see 5xx, not a preformatted message).
+    async fn post_json_raw(
+        &self,
+        path: &str,
+        directory: Option<&str>,
+        body: &Value,
+    ) -> Result<(reqwest::StatusCode, String), HarnessError> {
         let mut req = self
             .request(reqwest::Method::POST, path)
             .timeout(CALL_TIMEOUT)
@@ -583,14 +601,8 @@ impl Server {
             .await
             .map_err(|e| HarnessError::Protocol(format!("opencode POST {path}: {e}")))?;
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(HarnessError::Protocol(format!(
-                "opencode POST {path}: {status} {}",
-                truncate_body(&body)
-            )));
-        }
-        Ok(resp.json::<Value>().await.unwrap_or(Value::Null))
+        let text = resp.text().await.unwrap_or_default();
+        Ok((status, text))
     }
 
     async fn shutdown(&mut self, kill_grace: Duration) {
@@ -633,6 +645,21 @@ fn truncate_body(body: &str) -> String {
             end -= 1;
         }
         format!("{}…", &trimmed[..end])
+    }
+}
+
+/// POST failure text; 5xx adds where the body's `ref` resolves — opencode's
+/// own error bodies say only "Check server logs for details.", which sends
+/// users to us instead of the log that holds the actual cause.
+fn post_error_message(path: &str, status: reqwest::StatusCode, body: &str) -> String {
+    let base = format!("opencode POST {path}: {status} {}", truncate_body(body));
+    if status.is_server_error() {
+        format!(
+            "{base} (server-side fault; the body's ref keys the cause in \
+             ~/.local/share/opencode/log/opencode.log)"
+        )
+    } else {
+        base
     }
 }
 
@@ -1387,12 +1414,39 @@ async fn run_session(session: Session) {
 }
 
 async fn create_session(server: &Server, dir: Option<&str>) -> Result<String, HarnessError> {
-    let created = server.post_json("/session", dir, &json!({})).await?;
-    created
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| HarnessError::Protocol("opencode session create returned no id".into()))
+    // opencode 1.18.x lazily migrates a directory's legacy rows on its
+    // FIRST directory-scoped request (`Project.migrateProjectId`). On a db
+    // whose schema a newer 2.x install has rewritten, that migration throws
+    // mid-request — observed live: `SQLiteError: no such column:
+    // project_id` → `500 UnknownError` on `POST /session` — but the project
+    // row it inserted commits BEFORE the throw, so the identical request
+    // retried immediately succeeds. Retry once on any 5xx: this failure
+    // class then costs one round-trip instead of a dead turn.
+    for attempt in 0..2 {
+        let (status, text) = server.post_json_raw("/session", dir, &json!({})).await?;
+        if status.is_success() {
+            let created = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+            return created
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    HarnessError::Protocol("opencode session create returned no id".into())
+                });
+        }
+        if attempt == 0 && status.is_server_error() {
+            tracing::debug!(
+                target: "zeron_harness::opencode",
+                "POST /session answered {status}; retrying once (the lazy-migration crash self-heals)"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+        return Err(HarnessError::Protocol(post_error_message(
+            "/session", status, &text,
+        )));
+    }
+    unreachable!("create_session retry loop returns from every path")
 }
 
 fn context_usage_event(info: &Value, context_windows: &HashMap<String, u64>) -> Option<AgentEvent> {
