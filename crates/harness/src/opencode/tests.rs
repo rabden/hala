@@ -4,6 +4,7 @@ use super::*;
 /// installed CLI is involved, so duplicate completion frames are reproducible.
 struct TurnWire {
     bus: mpsc::UnboundedSender<Value>,
+    posts: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
     requests: mpsc::UnboundedReceiver<String>,
     events: mpsc::Receiver<Result<AgentEvent, HarnessError>>,
     interrupt: tokio_util::sync::CancellationToken,
@@ -27,18 +28,30 @@ impl TurnWire {
     /// `v2` serves the 2.x wire (`/api/*` routes, `{data}` wrappers,
     /// version-bearing `/api/health`); otherwise the 1.18 one.
     async fn start_proto(queued: bool, v2: bool) -> Self {
+        Self::start_policy(queued, v2, true, None).await
+    }
+
+    async fn start_policy(
+        queued: bool,
+        v2: bool,
+        auto_approve: bool,
+        answer: Option<bool>,
+    ) -> Self {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (bus, bus_rx) = mpsc::unbounded_channel::<Value>();
         let bus_rx = Arc::new(tokio::sync::Mutex::new(Some(bus_rx)));
         let (request_tx, requests) = mpsc::unbounded_channel();
+        let posts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = posts.clone();
         let server = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let bus_rx = bus_rx.clone();
                 let request_tx = request_tx.clone();
+                let recorded = recorded.clone();
                 connections.spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0; 4096];
@@ -51,6 +64,7 @@ impl TurnWire {
                         }
                     };
                     let header = String::from_utf8_lossy(&request[..header_end]);
+                    let is_post = header.starts_with("POST ");
                     let path = header.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_owned();
                     let length = header.lines().find_map(|line| {
                         let (name, value) = line.split_once(':')?;
@@ -61,6 +75,7 @@ impl TurnWire {
                         if n == 0 { return; }
                         request.extend_from_slice(&buf[..n]);
                     }
+                    if is_post { recorded.lock().unwrap().push((path.clone(), serde_json::from_slice(&request[header_end..header_end+length]).unwrap_or(Value::Null))); }
                     if path == "/global/event" || path == "/api/event" {
                         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: connected\n\n").await.unwrap();
                         let mut events = bus_rx.lock().await.take().unwrap();
@@ -75,7 +90,7 @@ impl TurnWire {
                             "/api/session" => r#"{"data":{"id":"fixture"}}"#,
                             "/api/command" => r#"{"data":[]}"#,
                             // Non-empty: the catalog-sync retry loop must not stall tests.
-                            "/api/model" => r#"{"data":[{"providerID":"opencode","id":"muse","name":"Muse","limit":{"context":1000},"variants":["low"],"enabled":true}]}"#,
+                            "/api/model" => r#"{"data":[{"providerID":"opencode","id":"muse","name":"Muse","limit":{"context":1000},"variants":[{"id":"low"}],"enabled":true}]}"#,
                             _ => "{}",
                         }
                     } else {
@@ -91,7 +106,7 @@ impl TurnWire {
                         || path.ends_with("/prompt")
                         || path.ends_with("/abort")
                         || path.ends_with("/interrupt")
-                        || path.ends_with("/model")
+                        || path == "/api/model"
                     {
                         let _ = request_tx.send(path);
                     }
@@ -115,12 +130,19 @@ impl TurnWire {
             server: Server::attached(base),
             event_tx,
             controls: RunControls {
-                request_input: Box::new(|_| panic!("fixture must not ask for input")),
+                request_input: Box::new(move |questions| {
+                    let answer = answer.expect("fixture must not ask for input");
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(questions.into_iter().map(|q| UserInputAnswer {
+                        question_id: q.id, labels: vec![if answer { "Yes" } else { "No" }.into()],
+                    }).collect());
+                    rx
+                }),
                 steering,
                 interrupt: interrupt.clone(),
             },
             request: serde_json::from_value(
-                json!({"prompt":"first", "cwd":"", "sandbox":"workspace-write"}),
+                json!({"prompt":"first", "cwd":"", "sandbox":"workspace-write", "autoApprove": auto_approve, "model": if v2 { Some("opencode/muse") } else { None }, "reasoning": "low"}),
             )
             .unwrap(),
             interrupt_grace: Duration::from_secs(2),
@@ -129,6 +151,7 @@ impl TurnWire {
         }));
         Self {
             bus,
+            posts,
             requests,
             events,
             interrupt,
@@ -336,7 +359,7 @@ async fn v2_wire_tool_frames_open_and_resolve_chips() {
     assert_eq!(
         calls,
         vec![(
-            "call_1".to_owned(),
+            "fixture:msg_a:call_1".to_owned(),
             ToolCall::ReadFile {
                 path: "/tmp/oc2x-probe/note.txt".to_owned()
             }
@@ -345,7 +368,7 @@ async fn v2_wire_tool_frames_open_and_resolve_chips() {
     assert_eq!(
         results,
         vec![(
-            "call_1".to_owned(),
+            "fixture:msg_a:call_1".to_owned(),
             Some("1: The secret word is BANANA42".to_owned())
         )]
     );
@@ -920,7 +943,9 @@ fn v2_frames_normalize_to_v1_payloads() {
         );
         assert_eq!(
             out,
-            vec![json!({"type":"session.idle","properties":{"sessionID":"ses_1"}})]
+            vec![
+                json!({"type":if kind == "session.execution.interrupted" { "session.interrupted" } else { "session.idle" },"properties":{"sessionID":"ses_1"}})
+            ]
         );
     }
     // Terminal failure = error chip + idle (both shapes captured live).
@@ -984,7 +1009,7 @@ fn v2_frames_normalize_to_v1_payloads() {
     assert_eq!(
         out,
         vec![json!({"type":"message.part.updated","properties":{"part":{
-            "sessionID":"ses_1","messageID":"msg_a","id":"call_1","callID":"call_1",
+            "sessionID":"ses_1","messageID":"msg_a","id":"ses_1:msg_a:call_1","callID":"ses_1:msg_a:call_1",
             "type":"tool","tool":"read",
             "state":{"status":"running","input":{"path":"/tmp/x"}}}}})]
     );
@@ -1013,7 +1038,7 @@ fn v2_frames_normalize_to_v1_payloads() {
     assert_eq!(
         out,
         vec![json!({"type":"permission.asked","properties":{
-            "id":"per_1","sessionID":"ses_1"}})]
+            "id":"per_1","sessionID":"ses_1","action":"external_directory","resources":["/tmp/*"]}})]
     );
     // Boilerplate frames (catalog sync etc.) drop.
     assert!(
@@ -1077,4 +1102,284 @@ fn prompt_body_v2_carries_text_and_files_only() {
         "model rides the session on 2.x"
     );
     assert!(body.get("parts").is_none());
+}
+
+#[tokio::test]
+async fn permissions_stay_session_scoped_and_never_persist_grants() {
+    for v2 in [false, true] {
+        let mut wire = TurnWire::start_proto(false, v2).await;
+        if v2 {
+            wire.request("/api/model").await;
+        }
+        wire.request(if v2 { "/prompt" } else { "/prompt_async" })
+            .await;
+        let ask = |owner: Option<&str>, id: &str| {
+            let mut data =
+                json!({"id":id, "action":"external_directory", "resources":["/private/*"]});
+            if let Some(owner) = owner {
+                data["sessionID"] = json!(owner);
+            }
+            if v2 {
+                json!({"type":"permission.asked", "data":data})
+            } else {
+                json!({"type":"permission.asked", "properties":data})
+            }
+        };
+        wire.bus.send(ask(Some("foreign"), "foreign")).unwrap();
+        wire.bus.send(ask(None, "missing")).unwrap();
+        // Establish an owned child before its first permission request.
+        wire.bus.send(if v2 {
+            json!({"type":"session.created","data":{"sessionID":"child","parentID":"fixture"}})
+        } else {
+            json!({"type":"session.created","properties":{"info":{"id":"child","parentID":"fixture"}}})
+        }).unwrap();
+        wire.bus.send(ask(Some("child"), "child")).unwrap();
+        wire.bus.send(ask(Some("fixture"), "own")).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if wire
+                    .posts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(p, _)| p.contains("permission"))
+                    .count()
+                    >= 2
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let posts = wire.posts.lock().unwrap();
+        let approvals: Vec<_> = posts
+            .iter()
+            .filter(|(p, _)| p.contains("permission"))
+            .collect();
+        assert_eq!(
+            approvals.len(),
+            2,
+            "foreign or ownerless permission was answered"
+        );
+        for (path, body) in approvals {
+            assert_eq!(body["reply"], "once");
+            assert!(!path.contains("foreign") && !path.contains("missing"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn permissions_without_auto_approve_require_an_explicit_answer() {
+    for accept in [false, true] {
+        let mut wire = TurnWire::start_policy(false, true, false, Some(accept)).await;
+        wire.request("/api/model").await;
+        wire.request("/prompt").await;
+        wire.v2(
+            "permission.asked",
+            json!({"id":"approval", "sessionID":"fixture"}),
+        );
+        let body = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some((_, body)) = wire
+                    .posts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(p, _)| p.contains("permission"))
+                {
+                    break body.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(body["reply"], if accept { "once" } else { "reject" });
+    }
+}
+
+#[test]
+fn v2_tools_are_scoped_and_retired_and_real_failures_are_visible() {
+    let mut tools = HashMap::new();
+    let event = |kind, session, message, name| {
+        json!({"type":kind,"data":{
+            "sessionID":session,"assistantMessageID":message,"id":"same","name":name,
+            "error":{"type":"permission.denied","message":"Denied"}
+        }})
+    };
+    for (session, message, name) in [
+        ("a", "m1", "read"),
+        ("b", "m1", "bash"),
+        ("a", "m2", "write"),
+    ] {
+        normalize_v2_frame(
+            event("session.tool.input.started", session, message, name),
+            &mut tools,
+        );
+    }
+    for (session, message, name) in [
+        ("a", "m1", "read"),
+        ("b", "m1", "bash"),
+        ("a", "m2", "write"),
+    ] {
+        let out = normalize_v2_frame(
+            event("session.tool.failed", session, message, ""),
+            &mut tools,
+        );
+        assert_eq!(out[0].pointer("/properties/part/tool").unwrap(), name);
+        assert_eq!(
+            out[0].pointer("/properties/part/state/status").unwrap(),
+            "error"
+        );
+        assert_eq!(
+            out[0].pointer("/properties/part/callID").unwrap(),
+            &json!(format!("{session}:{message}:same"))
+        );
+    }
+    assert!(tools.is_empty());
+    normalize_v2_frame(
+        event("session.tool.input.started", "a", "m1", "read"),
+        &mut tools,
+    );
+    normalize_v2_frame(
+        event("session.execution.interrupted", "a", "m1", ""),
+        &mut tools,
+    );
+    assert!(tools.is_empty());
+}
+
+#[tokio::test]
+async fn v2_reasoning_deltas_and_failed_tools_reach_the_feed() {
+    let mut wire = TurnWire::start_proto(false, true).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID":"fixture"}));
+    wire.v2(
+        "session.step.started",
+        json!({"sessionID":"fixture","assistantMessageID":"m"}),
+    );
+    wire.v2(
+        "session.reasoning.started",
+        json!({"sessionID":"fixture","assistantMessageID":"m","ordinal":0}),
+    );
+    wire.v2(
+        "session.reasoning.delta",
+        json!({"sessionID":"fixture","assistantMessageID":"m","ordinal":0,"delta":"Thinking"}),
+    );
+    wire.v2(
+        "session.tool.input.started",
+        json!({"sessionID":"fixture","assistantMessageID":"m","id":"c","name":"read"}),
+    );
+    wire.v2("session.tool.failed",json!({"sessionID":"fixture","assistantMessageID":"m","id":"c","error":{"message":"Denied"}}));
+    wire.v2(
+        "session.execution.succeeded",
+        json!({"sessionID":"fixture"}),
+    );
+    let mut reasoning = String::new();
+    let mut failed = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), wire.events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        {
+            AgentEvent::ReasoningDelta { text } => reasoning.push_str(&text),
+            AgentEvent::ToolResult { is_error, .. } => failed |= is_error,
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(reasoning, "Thinking");
+    assert!(failed);
+}
+
+#[tokio::test]
+async fn prompt_error_and_interrupt_before_busy_still_settle() {
+    let mut wire = TurnWire::start(false).await;
+    wire.request("/prompt_async").await;
+    wire.bus.send(json!({"type":"session.error", "properties":{"sessionID":"fixture", "error":{"name":"ProviderError", "data":{"message":"bad model"}}}})).unwrap();
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Errored);
+
+    let mut wire = TurnWire::start(false).await;
+    wire.request("/prompt_async").await;
+    wire.interrupt.cancel();
+    wire.request("/abort").await;
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Interrupted);
+}
+
+#[tokio::test]
+async fn v2_model_selection_and_prompt_use_the_documented_bodies() {
+    let mut wire = TurnWire::start_proto(false, true).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    let posts = wire.posts.lock().unwrap();
+    assert_eq!(
+        posts
+            .iter()
+            .find(|(p, _)| p == "/api/session/fixture/model")
+            .unwrap()
+            .1,
+        json!({"model":{"providerID":"opencode","id":"muse","variant":"low"}})
+    );
+    assert_eq!(
+        posts
+            .iter()
+            .find(|(p, _)| p == "/api/session/fixture/prompt")
+            .unwrap()
+            .1,
+        json!({"text":"first","files":[]})
+    );
+}
+
+#[tokio::test]
+async fn v2_pending_tool_overflow_fails_the_run_instead_of_growing_forever() {
+    let mut wire = TurnWire::start_proto(false, true).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    for i in 0..=MAX_PENDING_V2_TOOLS {
+        wire.v2("session.tool.input.started",json!({"sessionID":"other","assistantMessageID":"m","id":format!("c{i}"),"name":"read"}));
+    }
+    assert_eq!(wire.done().await.0, DoneStatus::Errored);
+}
+
+#[tokio::test]
+async fn v2_external_interrupt_is_not_reported_as_success() {
+    let mut wire = TurnWire::start_proto(false, true).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2(
+        "session.execution.interrupted",
+        json!({"sessionID":"fixture","reason":"shutdown"}),
+    );
+    assert_eq!(wire.done().await.0, DoneStatus::Interrupted);
+}
+
+#[tokio::test]
+async fn v2_recovered_step_failure_does_not_poison_successful_execution() {
+    let mut wire = TurnWire::start_proto(false, true).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID":"fixture"}));
+    wire.v2(
+        "session.step.failed",
+        json!({"sessionID":"fixture","error":{"type":"provider.rate_limit","message":"Retrying"}}),
+    );
+    wire.v2(
+        "session.step.started",
+        json!({"sessionID":"fixture","assistantMessageID":"recovered"}),
+    );
+    wire.v2("session.text.ended",json!({"sessionID":"fixture","assistantMessageID":"recovered","ordinal":0,"text":"Recovered"}));
+    wire.v2(
+        "session.execution.succeeded",
+        json!({"sessionID":"fixture"}),
+    );
+    let (status, text) = wire.done().await;
+    assert_eq!(status, DoneStatus::Completed);
+    assert_eq!(text, "Recovered");
 }

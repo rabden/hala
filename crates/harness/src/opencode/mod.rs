@@ -1666,6 +1666,7 @@ async fn run_session(session: Session) {
                             dir,
                             event_tx: &event_tx,
                             request_input: &request_input,
+                            auto_approve: request.auto_approve,
                             main_feed: &mut main_feed,
                             children: &mut children,
                             pending_spawns: &mut pending_spawns,
@@ -1678,6 +1679,10 @@ async fn run_session(session: Session) {
                             BusOutcome::Continue => {}
                             BusOutcome::ConsumerGone => break 'main,
                             BusOutcome::TurnIdle => settle_idle!('main),
+                            BusOutcome::TurnInterrupted => {
+                                interrupt_requested = true;
+                                settle_idle!('main);
+                            }
                         }
                     }
                 }
@@ -1978,6 +1983,7 @@ enum BusOutcome {
     Continue,
     /// Our session's turn reached idle.
     TurnIdle,
+    TurnInterrupted,
     ConsumerGone,
 }
 
@@ -1994,6 +2000,7 @@ struct BusCtx<'a> {
     dir: Option<&'a str>,
     event_tx: &'a mpsc::Sender<Result<AgentEvent, HarnessError>>,
     request_input: &'a Arc<RequestInput>,
+    auto_approve: bool,
     main_feed: &'a mut SessionFeed,
     children: &'a mut HashMap<String, ChildRun>,
     pending_spawns: &'a mut VecDeque<PendingSpawn>,
@@ -2045,6 +2052,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
         dir,
         event_tx,
         request_input,
+        auto_approve,
         main_feed,
         children,
         pending_spawns,
@@ -2078,6 +2086,9 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
         });
 
     let is_ours = event_session == Some(session_id);
+    if is_ours && kind == "session.interrupted" {
+        return BusOutcome::TurnInterrupted;
+    }
     let status = props
         .get("status")
         .and_then(|s| s.get("type"))
@@ -2136,7 +2147,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             }
             BusOutcome::Continue
         }
-        "session.error" => {
+        "session.error" | "session.warning" => {
             // Errors are session-scoped but a missing id still concerns us
             // (global provider failures).
             if event_session.is_some() && !is_ours {
@@ -2169,7 +2180,9 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                 let prev = first(prev);
                 !line.is_empty() && (prev.contains(&line) || line.contains(&prev))
             });
-            turn.error = Some(message.clone());
+            if kind == "session.error" {
+                turn.error = Some(message.clone());
+            }
             if !duplicate && !send(event_tx, AgentEvent::Error { message }).await {
                 return BusOutcome::ConsumerGone;
             }
@@ -2344,14 +2357,19 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             BusOutcome::Continue
         }
         "permission.asked" => {
-            // Parity with every other driver: sessions run unattended, so
-            // permissions auto-approve ("always" also whitelists the
-            // pattern, cutting future asks). Child sessions included — the
-            // ACP layer silently dropped those and subagents hung.
+            // A global bus includes unrelated sessions. Never answer their
+            // requests, or a malformed request without an explicit owner.
+            let Some(session) = event_session.filter(|session| {
+                *session == session_id
+                    || children.get(*session).is_some_and(|child| !child.done)
+                    || unbound_children.contains_key(*session)
+            }) else {
+                return BusOutcome::Continue;
+            };
             let Some(id) = props.get("id").and_then(Value::as_str) else {
                 return BusOutcome::Continue;
             };
-            let session = event_session.unwrap_or(session_id).to_owned();
+            let session = session.to_owned();
             let protocol = server.protocol().await;
             // 1.x: global permission endpoint + a session-scoped fallback;
             // 2.x: the reply rides the session's permission route
@@ -2370,6 +2388,14 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             let auth = server.auth.clone();
             let dir_owned = dir.map(str::to_owned);
             let protocol_cell = server.protocol.clone();
+            let permission_input = Arc::clone(request_input);
+            let question = UserInputQuestion {
+                id: format!("permission:{id}"),
+                header: "Permission".into(),
+                question: format!("Allow this OpenCode request once? {}", props),
+                options: vec!["No".into(), "Yes".into()],
+                multi_select: false,
+            };
             tokio::spawn(async move {
                 let server = Server {
                     child: None,
@@ -2379,11 +2405,26 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                     stderr_tail: crate::StderrTail::default(),
                     protocol: protocol_cell,
                 };
+                let allowed = auto_approve
+                    || (permission_input)(vec![question.clone()])
+                        .await
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|answer| {
+                            answer.question_id == question.id
+                                && answer
+                                    .labels
+                                    .iter()
+                                    .any(|label| label.eq_ignore_ascii_case("yes"))
+                        });
+                // V2 "always" writes durable project-wide permission rules.
+                // Approval of this request must not grant future runs access.
+                let reply = if allowed { "once" } else { "reject" };
                 if server
                     .post_json(
                         &reply_path,
                         dir_owned.as_deref(),
-                        &json!({ "reply": "always" }),
+                        &json!({ "reply": reply }),
                     )
                     .await
                     .is_err()
@@ -2393,7 +2434,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                         .post_json(
                             &fallback_path,
                             dir_owned.as_deref(),
-                            &json!({ "response": "always" }),
+                            &json!({ "response": reply }),
                         )
                         .await;
                 }
@@ -2401,6 +2442,13 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             BusOutcome::Continue
         }
         "question.asked" => {
+            if !event_session.is_some_and(|session| {
+                session == session_id
+                    || children.get(session).is_some_and(|child| !child.done)
+                    || unbound_children.contains_key(session)
+            }) {
+                return BusOutcome::Continue;
+            }
             let Some(id) = props.get("id").and_then(Value::as_str) else {
                 return BusOutcome::Continue;
             };
@@ -3008,22 +3056,62 @@ fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
 ///   `.success` (content array) / `.error`.
 /// - usage: `session.usage.updated` with the cumulative token totals.
 ///
-/// `tool_names` carries call-id → tool-name across the tool frames.
-fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<String, String>) -> Vec<Value> {
+/// `tool_names` tracks pending calls by session, message, and provider call id.
+type V2ToolKey = (String, String, String);
+const MAX_PENDING_V2_TOOLS: usize = 4096;
+
+fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>) -> Vec<Value> {
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
     let data = event.get("data").cloned().unwrap_or(Value::Null);
+    if data
+        .get("sessionID")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Vec::new();
+    }
     let session = || data.get("sessionID").cloned().unwrap_or(Value::Null);
     let message = || {
         data.get("assistantMessageID")
             .cloned()
             .unwrap_or(Value::Null)
     };
+    let tool_key = || {
+        (
+            data.get("sessionID")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            data.get("assistantMessageID")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            data.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        )
+    };
+    if matches!(
+        kind,
+        "session.execution.succeeded"
+            | "session.execution.interrupted"
+            | "session.execution.failed"
+    ) {
+        tool_names.retain(|(owner, _, _), _| {
+            Some(owner.as_str()) != data.get("sessionID").and_then(Value::as_str)
+        });
+    }
     match kind {
         "session.execution.started" => vec![json!({
             "type": "session.status",
             "properties": { "sessionID": session(), "status": { "type": "busy" } }
         })],
-        "session.execution.succeeded" | "session.execution.interrupted" => vec![json!({
+        "session.execution.interrupted" => vec![json!({
+            "type": "session.interrupted",
+            "properties": { "sessionID": session() }
+        })],
+        "session.execution.succeeded" => vec![json!({
             "type": "session.idle",
             "properties": { "sessionID": session() }
         })],
@@ -3044,7 +3132,9 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<String, String>) ->
             if data.pointer("/error/type").and_then(Value::as_str) == Some("aborted") {
                 return Vec::new();
             }
-            vec![v2_error_payload(&data)]
+            let mut warning = v2_error_payload(&data);
+            warning["type"] = json!("session.warning");
+            vec![warning]
         }
         "session.step.started" => vec![json!({
             "type": "message.updated",
@@ -3059,12 +3149,12 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<String, String>) ->
                 data.get("text").cloned().unwrap_or(json!("")),
             )]
         }
-        "session.text.delta" => vec![json!({
+        "session.text.delta" | "session.reasoning.delta" => vec![json!({
             "type": "message.part.delta",
             "properties": {
                 "sessionID": session(),
                 "messageID": message(),
-                "partID": v2_part_id(&data, 't'),
+                "partID": v2_part_id(&data, if kind == "session.reasoning.delta" { 'r' } else { 't' }),
                 "field": "text",
                 "delta": data.get("delta").cloned().unwrap_or(json!("")),
             }
@@ -3077,7 +3167,7 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<String, String>) ->
         "session.tool.input.started" => {
             let id = data.get("id").and_then(Value::as_str).unwrap_or_default();
             let name = data.get("name").and_then(Value::as_str).unwrap_or_default();
-            tool_names.insert(id.to_owned(), name.to_owned());
+            tool_names.insert(tool_key(), name.to_owned());
             vec![v2_tool_part(
                 &data,
                 id,
@@ -3087,7 +3177,10 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<String, String>) ->
         }
         "session.tool.called" => {
             let id = data.get("id").and_then(Value::as_str).unwrap_or_default();
-            let name = tool_names.get(id).map(String::as_str).unwrap_or_default();
+            let name = tool_names
+                .get(&tool_key())
+                .map(String::as_str)
+                .unwrap_or_default();
             let state = json!({
                 "status": "running",
                 "input": data.get("input").cloned().unwrap_or(json!({})),
@@ -3096,7 +3189,7 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<String, String>) ->
         }
         "session.tool.success" => {
             let id = data.get("id").and_then(Value::as_str).unwrap_or_default();
-            let name = tool_names.get(id).map(String::as_str).unwrap_or_default();
+            let name = tool_names.remove(&tool_key()).unwrap_or_default();
             let output = data
                 .get("content")
                 .and_then(Value::as_array)
@@ -3111,13 +3204,13 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<String, String>) ->
             vec![v2_tool_part(
                 &data,
                 id,
-                name,
+                &name,
                 &json!({ "status": "completed", "output": output }),
             )]
         }
-        "session.tool.error" => {
+        "session.tool.failed" | "session.tool.error" => {
             let id = data.get("id").and_then(Value::as_str).unwrap_or_default();
-            let name = tool_names.get(id).map(String::as_str).unwrap_or_default();
+            let name = tool_names.remove(&tool_key()).unwrap_or_default();
             let error = data.get("error").cloned().unwrap_or(Value::Null);
             let message = error
                 .get("message")
@@ -3128,7 +3221,7 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<String, String>) ->
             vec![v2_tool_part(
                 &data,
                 id,
-                name,
+                &name,
                 &json!({ "status": "error", "error": message }),
             )]
         }
@@ -3172,16 +3265,16 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<String, String>) ->
                 }
             })]
         }
-        // Same event name as 1.x, same auto-approve policy: the reply
-        // route differs by generation (the handler picks it). Observed live
+        // Same event name as 1.x; preserve permission details for the reply
+        // and any interactive approval. The route differs by generation. Observed live
         // on 2.0.3 when a tool reaches outside the workspace.
         "permission.asked" => {
-            let Some(id) = data.get("id").and_then(Value::as_str) else {
+            if data.get("id").and_then(Value::as_str).is_none() {
                 return Vec::new();
-            };
+            }
             vec![json!({
                 "type": "permission.asked",
-                "properties": { "id": id, "sessionID": session() }
+                "properties": data
             })]
         }
         _ => Vec::new(),
@@ -3239,6 +3332,17 @@ fn v2_stream_part(data: &Value, part_type: &str, text: Value) -> Value {
 
 /// A tool frame in the 1.x tool-part shape (`callID` keys the chip).
 fn v2_tool_part(data: &Value, id: &str, name: &str, state: &Value) -> Value {
+    // Provider call ids can repeat across assistant messages. Both the feed's
+    // state key and the emitted chip id must keep those calls distinct.
+    let id = format!(
+        "{}:{}:{id}",
+        data.get("sessionID")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        data.get("assistantMessageID")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    );
     json!({
         "type": "message.part.updated",
         "properties": { "part": {
@@ -3308,7 +3412,7 @@ async fn stream_bus(tx: &mpsc::Sender<BusMsg>, resp: reqwest::Response, protocol
     let mut announced = false;
     // 2.x names a tool only when its input starts streaming; the later
     // called/success frames carry the call id alone.
-    let mut v2_tool_names: HashMap<String, String> = HashMap::new();
+    let mut v2_tool_names: HashMap<V2ToolKey, String> = HashMap::new();
     while let Some(chunk) = stream.next().await {
         let Ok(bytes) = chunk else {
             return;
@@ -3337,7 +3441,12 @@ async fn stream_bus(tx: &mpsc::Sender<BusMsg>, resp: reqwest::Response, protocol
                     continue;
                 };
                 if protocol == Protocol::V2 {
-                    for payload in normalize_v2_frame(event, &mut v2_tool_names) {
+                    let payloads = normalize_v2_frame(event, &mut v2_tool_names);
+                    if v2_tool_names.len() > MAX_PENDING_V2_TOOLS {
+                        let _ = tx.send(BusMsg::Disconnected).await;
+                        return;
+                    }
+                    for payload in payloads {
                         if tx.send(BusMsg::Event(payload)).await.is_err() {
                             return;
                         }

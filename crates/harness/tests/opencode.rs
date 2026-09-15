@@ -936,3 +936,33 @@ async fn models_discover_from_the_provider_catalog() {
     let commands = harness.commands().await.expect("commands");
     assert_eq!(commands[0].name, "init");
 }
+
+#[tokio::test]
+async fn repeated_session_create_failure_stops_after_one_retry() {
+    let fake = FakeOpencode::start().await;
+    *fake.fail_session_creates.lock().unwrap() = 10;
+    let (controls, _, _) = controls();
+    let mut stream = harness(&fake).run(request("hi"), controls).await.unwrap();
+    let events = drain_to_done(&mut stream).await;
+    assert_eq!(
+        fake.posts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "/session")
+            .count(),
+        2
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SessionStarted { .. }))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
+            ..
+        })
+    ));
+}
