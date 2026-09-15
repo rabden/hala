@@ -21,6 +21,12 @@ impl Drop for TurnWire {
 
 impl TurnWire {
     async fn start(queued: bool) -> Self {
+        Self::start_proto(queued, false).await
+    }
+
+    /// `v2` serves the 2.x wire (`/api/*` routes, `{data}` wrappers,
+    /// version-bearing `/api/health`); otherwise the 1.18 one.
+    async fn start_proto(queued: bool, v2: bool) -> Self {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -55,7 +61,7 @@ impl TurnWire {
                         if n == 0 { return; }
                         request.extend_from_slice(&buf[..n]);
                     }
-                    if path == "/global/event" {
+                    if path == "/global/event" || path == "/api/event" {
                         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: connected\n\n").await.unwrap();
                         let mut events = bus_rx.lock().await.take().unwrap();
                         while let Some(event) = events.recv().await {
@@ -63,13 +69,30 @@ impl TurnWire {
                         }
                         return;
                     }
-                    let body = match path.as_str() {
-                        "/session" => r#"{"id":"fixture"}"#,
-                        "/command" => "[]",
-                        _ => "{}",
+                    let body = if v2 {
+                        match path.as_str() {
+                            "/api/health" => r#"{"healthy":true,"version":"2.0.3"}"#,
+                            "/api/session" => r#"{"data":{"id":"fixture"}}"#,
+                            "/api/command" => r#"{"data":[]}"#,
+                            // Non-empty: the catalog-sync retry loop must not stall tests.
+                            "/api/model" => r#"{"data":[{"providerID":"opencode","id":"muse","name":"Muse","limit":{"context":1000},"variants":["low"],"enabled":true}]}"#,
+                            _ => "{}",
+                        }
+                    } else {
+                        match path.as_str() {
+                            "/global/health" => r#"{"healthy":true,"version":"1.18.31"}"#,
+                            "/session" => r#"{"id":"fixture"}"#,
+                            "/command" => "[]",
+                            _ => "{}",
+                        }
                     };
                     socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-                    if path.ends_with("/prompt_async") || path.ends_with("/abort") {
+                    if path.ends_with("/prompt_async")
+                        || path.ends_with("/prompt")
+                        || path.ends_with("/abort")
+                        || path.ends_with("/interrupt")
+                        || path.ends_with("/model")
+                    {
                         let _ = request_tx.send(path);
                     }
                 });
@@ -132,6 +155,14 @@ impl TurnWire {
             .unwrap();
     }
 
+    /// Push one raw 2.x `/api/event` frame (normalized in the real
+    /// stream_bus, not here).
+    fn v2(&self, kind: &str, data: Value) {
+        self.bus
+            .send(json!({"id": format!("evt_{kind}"), "type": kind, "data": data}))
+            .unwrap();
+    }
+
     async fn done(&mut self) -> (DoneStatus, String) {
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut text = String::new();
@@ -178,18 +209,185 @@ async fn queued_turn_ignores_previous_turn_duplicate_idle() {
 }
 
 #[tokio::test]
-async fn prompt_error_and_interrupt_before_busy_still_settle() {
-    let mut wire = TurnWire::start(false).await;
-    wire.request("/prompt_async").await;
-    wire.bus.send(json!({"type":"session.error", "properties":{"sessionID":"fixture", "error":{"name":"ProviderError", "data":{"message":"bad model"}}}})).unwrap();
-    wire.idle();
-    assert_eq!(wire.done().await.0, DoneStatus::Errored);
+async fn v2_wire_streams_text_and_settles_on_execution_success() {
+    let mut wire = TurnWire::start_proto(false, true).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID": "fixture"}));
+    wire.v2(
+        "session.step.started",
+        json!({
+            "sessionID": "fixture",
+            "assistantMessageID": "msg_a",
+            "model": {"id": "muse", "providerID": "opencode", "variant": "low"},
+        }),
+    );
+    wire.v2(
+        "session.text.started",
+        json!({
+            "sessionID": "fixture", "assistantMessageID": "msg_a", "ordinal": 0
+        }),
+    );
+    wire.v2(
+        "session.text.delta",
+        json!({
+            "sessionID": "fixture", "assistantMessageID": "msg_a", "ordinal": 0,
+            "delta": "PONG"
+        }),
+    );
+    wire.v2(
+        "session.text.ended",
+        json!({
+            "sessionID": "fixture", "assistantMessageID": "msg_a", "ordinal": 0,
+            "text": "PONG"
+        }),
+    );
+    wire.v2(
+        "session.usage.updated",
+        json!({
+            "sessionID": "fixture", "cost": 0,
+            "tokens": {"input": 10, "output": 2, "reasoning": 0,
+                       "cache": {"read": 0, "write": 0}}
+        }),
+    );
+    wire.v2(
+        "session.execution.succeeded",
+        json!({"sessionID": "fixture"}),
+    );
 
-    let mut wire = TurnWire::start(false).await;
-    wire.request("/prompt_async").await;
+    let (status, text, usage) = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut text = String::new();
+        let mut usage = None;
+        loop {
+            match wire.events.recv().await.unwrap().unwrap() {
+                AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                AgentEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                } => {
+                    usage = Some((input_tokens, output_tokens));
+                }
+                AgentEvent::Done { status, .. } => return (status, text, usage),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, DoneStatus::Completed);
+    assert_eq!(text, "PONG");
+    assert_eq!(usage, Some((10, 2)));
+}
+
+#[tokio::test]
+async fn v2_wire_tool_frames_open_and_resolve_chips() {
+    let mut wire = TurnWire::start_proto(false, true).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID": "fixture"}));
+    wire.v2(
+        "session.step.started",
+        json!({
+            "sessionID": "fixture", "assistantMessageID": "msg_a"
+        }),
+    );
+    wire.v2(
+        "session.tool.input.started",
+        json!({
+            "sessionID": "fixture", "assistantMessageID": "msg_a",
+            "id": "call_1", "name": "read"
+        }),
+    );
+    wire.v2(
+        "session.tool.called",
+        json!({
+            "sessionID": "fixture", "assistantMessageID": "msg_a",
+            "id": "call_1", "input": {"path": "/tmp/oc2x-probe/note.txt"}
+        }),
+    );
+    wire.v2(
+        "session.tool.success",
+        json!({
+            "sessionID": "fixture", "assistantMessageID": "msg_a",
+            "id": "call_1",
+            "content": [{"type": "text", "text": "1: The secret word is BANANA42"}]
+        }),
+    );
+    wire.v2(
+        "session.execution.succeeded",
+        json!({"sessionID": "fixture"}),
+    );
+
+    let (status, calls, results) = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut calls = Vec::new();
+        let mut results = Vec::new();
+        loop {
+            match wire.events.recv().await.unwrap().unwrap() {
+                AgentEvent::ToolCall { id, call } => calls.push((id, call)),
+                AgentEvent::ToolResult { id, output, .. } => results.push((id, output)),
+                AgentEvent::Done { status, .. } => return (status, calls, results),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, DoneStatus::Completed);
+    assert_eq!(
+        calls,
+        vec![(
+            "call_1".to_owned(),
+            ToolCall::ReadFile {
+                path: "/tmp/oc2x-probe/note.txt".to_owned()
+            }
+        )]
+    );
+    assert_eq!(
+        results,
+        vec![(
+            "call_1".to_owned(),
+            Some("1: The secret word is BANANA42".to_owned())
+        )]
+    );
+}
+
+#[tokio::test]
+async fn v2_execution_failure_and_interrupt_settle_the_turn() {
+    let mut wire = TurnWire::start_proto(false, true).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID": "fixture"}));
+    wire.v2(
+        "session.execution.failed",
+        json!({"sessionID": "fixture", "error": {"type": "provider.auth", "message": ""}}),
+    );
+    let (status, error) = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut error = None;
+        loop {
+            match wire.events.recv().await.unwrap().unwrap() {
+                AgentEvent::Error { message } => error = Some(message),
+                AgentEvent::Done {
+                    status, error: e, ..
+                } => return (status, e.or(error)),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, DoneStatus::Errored);
+    assert!(error.unwrap().contains("provider.auth"));
+
+    let mut wire = TurnWire::start_proto(false, true).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID": "fixture"}));
     wire.interrupt.cancel();
-    wire.request("/abort").await;
-    wire.idle();
+    wire.request("/interrupt").await;
+    wire.v2(
+        "session.execution.interrupted",
+        json!({"sessionID": "fixture", "reason": "user"}),
+    );
     assert_eq!(wire.done().await.0, DoneStatus::Interrupted);
 }
 
@@ -404,7 +602,7 @@ fn variants_only_ride_models_that_advertise_them() {
 fn prompt_body_carries_model_variant_and_attachments() {
     let body = prompt_body(
         "hello",
-        &Some(("anthropic".into(), "claude-opus-5".into())),
+        Some(("anthropic", "claude-opus-5")),
         Some("high"),
         &["/tmp/shot.png".to_owned()],
     );
@@ -697,4 +895,186 @@ fn directory_header_percent_encodes() {
         "/home/u/my%20project"
     );
     assert_eq!(encode_directory("/plain/path"), "/plain/path");
+}
+
+#[test]
+fn v2_frames_normalize_to_v1_payloads() {
+    let mut tools = HashMap::new();
+    // Lifecycle: busy on start, idle on the terminal frames.
+    let out = normalize_v2_frame(
+        json!({"id":"evt_1","type":"session.execution.started","data":{"sessionID":"ses_1"}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"session.status","properties":{
+            "sessionID":"ses_1","status":{"type":"busy"}}})]
+    );
+    for kind in [
+        "session.execution.succeeded",
+        "session.execution.interrupted",
+    ] {
+        let out = normalize_v2_frame(
+            json!({"id":"evt_2","type":kind,"data":{"sessionID":"ses_1"}}),
+            &mut tools,
+        );
+        assert_eq!(
+            out,
+            vec![json!({"type":"session.idle","properties":{"sessionID":"ses_1"}})]
+        );
+    }
+    // Terminal failure = error chip + idle (both shapes captured live).
+    let out = normalize_v2_frame(
+        json!({"id":"evt_3","type":"session.execution.failed","data":{
+            "sessionID":"ses_1","error":{"type":"provider.auth","message":""}}}),
+        &mut tools,
+    );
+    assert_eq!(out.len(), 2);
+    // Empty message (live shape) falls back to the error type.
+    assert_eq!(
+        out[0],
+        json!({"type":"session.error","properties":{
+            "sessionID":"ses_1",
+            "error":{"name":"provider.auth","data":{"message":"provider.auth"}}}}),
+    );
+    // The interrupt's step-level echo is NOT a provider error.
+    assert!(
+        normalize_v2_frame(
+            json!({"id":"evt_4","type":"session.step.failed","data":{
+            "sessionID":"ses_1","error":{"type":"aborted","message":"Step interrupted"}}}),
+            &mut tools,
+        )
+        .is_empty()
+    );
+    // Streaming: the step registers its assistant message, then text flows
+    // as a part delta keyed by message + kind + ordinal.
+    let out = normalize_v2_frame(
+        json!({"id":"evt_5","type":"session.step.started","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a"}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"message.updated","properties":{
+            "info":{"sessionID":"ses_1","id":"msg_a","role":"assistant"}}})]
+    );
+    let out = normalize_v2_frame(
+        json!({"id":"evt_6","type":"session.text.delta","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a","ordinal":0,"delta":"hi"}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"message.part.delta","properties":{
+            "sessionID":"ses_1","messageID":"msg_a","partID":"msg_a:t0",
+            "field":"text","delta":"hi"}})]
+    );
+    // A tool: the NAME rides input.started; later frames carry only ids.
+    normalize_v2_frame(
+        json!({"id":"evt_7","type":"session.tool.input.started","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a","id":"call_1","name":"read"}}),
+        &mut tools,
+    );
+    let out = normalize_v2_frame(
+        json!({"id":"evt_8","type":"session.tool.called","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a","id":"call_1",
+            "input":{"path":"/tmp/x"}}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"message.part.updated","properties":{"part":{
+            "sessionID":"ses_1","messageID":"msg_a","id":"call_1","callID":"call_1",
+            "type":"tool","tool":"read",
+            "state":{"status":"running","input":{"path":"/tmp/x"}}}}})]
+    );
+    // Usage totals reach the engine as an assistant message.updated.
+    let out = normalize_v2_frame(
+        json!({"id":"evt_9","type":"session.usage.updated","data":{
+            "sessionID":"ses_1","cost":0,
+            "tokens":{"input":10,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"message.updated","properties":{
+            "info":{"sessionID":"ses_1","id":"usage","role":"assistant",
+                    "tokens":{"input":10,"output":2,"reasoning":0,
+                              "cache":{"read":0,"write":0}}}}})]
+    );
+    // The permission ask keeps its 1.x name on 2.x (observed live when a
+    // tool reaches outside the workspace); the auto-approver replies.
+    let out = normalize_v2_frame(
+        json!({"id":"evt_11","type":"permission.asked","data":{
+            "id":"per_1","sessionID":"ses_1","action":"external_directory",
+            "resources":["/tmp/*"]}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"permission.asked","properties":{
+            "id":"per_1","sessionID":"ses_1"}})]
+    );
+    // Boilerplate frames (catalog sync etc.) drop.
+    assert!(
+        normalize_v2_frame(
+            json!({"id":"evt_10","type":"catalog.updated","data":{}}),
+            &mut tools,
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn v2_model_list_folds_into_provider_catalog() {
+    let list: V2ModelList = serde_json::from_value(json!({
+        "location": {"directory": "/w"},
+        "data": [
+            {"providerID": "opencode", "id": "muse-spark", "name": "Muse Spark",
+             "limit": {"context": 1000000},
+             // Live shape: variants are `{id, settings}` objects.
+             "variants": [{"id": "low", "settings": {"x": 1}}, {"id": "high"}],
+             "enabled": true},
+            {"providerID": "opencode", "id": "plain", "enabled": true},
+            {"providerID": "dead", "id": "off", "enabled": false},
+        ]
+    }))
+    .unwrap();
+    let catalog = catalog_from_v2_models(list.data);
+    let models = models_from_providers(&catalog);
+    assert_eq!(models.len(), 2);
+    let muse = models
+        .iter()
+        .find(|m| m.id == "opencode/muse-spark")
+        .unwrap();
+    assert_eq!(muse.label, "Muse Spark");
+    assert_eq!(
+        muse.reasoning_levels,
+        vec![ReasoningLevel::Low, ReasoningLevel::High]
+    );
+    // The folded catalog feeds variant picking exactly like 1.x's.
+    assert_eq!(
+        pick_variant(
+            &catalog,
+            "opencode",
+            "muse-spark",
+            Some(ReasoningLevel::High)
+        )
+        .as_deref(),
+        Some("high")
+    );
+    assert!(models.iter().all(|m| m.id != "dead/off"));
+}
+
+#[test]
+fn prompt_body_v2_carries_text_and_files_only() {
+    let body = prompt_body_v2("hello", &["/tmp/shot.png".to_owned()]);
+    assert_eq!(body["text"], "hello");
+    assert_eq!(body["files"][0]["uri"], "file:///tmp/shot.png");
+    assert_eq!(body["files"][0]["name"], "shot.png");
+    assert!(
+        body.get("model").is_none(),
+        "model rides the session on 2.x"
+    );
+    assert!(body.get("parts").is_none());
 }
